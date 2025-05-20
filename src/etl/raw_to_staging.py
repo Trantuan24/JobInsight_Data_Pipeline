@@ -1,0 +1,333 @@
+"""
+ETL process for JobInsight data
+
+Luồng ETL:
+1. Dữ liệu đã được load từ raw_jobs vào staging_jobs bằng SQL
+2. Stored procedures xử lý cơ bản salary, deadline đã được thực thi
+3. Script này xử lý thêm các trường phức tạp bằng pandas và cập nhật lại staging_jobs
+
+- Input: staging_jobs table (đã có dữ liệu cơ bản và một số trường đã được xử lý bằng SQL)
+- Output: staging_jobs table (cập nhật thêm các trường đã xử lý bằng pandas)
+"""
+
+import os
+import json
+import logging
+import sys
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import re
+from typing import List, Dict, Any, Optional, Tuple
+from bs4 import BeautifulSoup
+
+# Thiết lập đường dẫn và logging
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
+sys.path.insert(0, PROJECT_ROOT)
+
+# Đảm bảo thư mục logs tồn tại
+LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+# Thiết lập logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, "processing.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Import modules từ utils
+try:
+    from src.utils.config import DB_CONFIG, RAW_JOBS_TABLE, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE, RAW_BATCH_SIZE
+    from src.utils.db import get_connection, execute_query, table_exists, get_dataframe, execute_stored_procedure, execute_sql_file
+except ImportError as e:
+    # Thử cách thay thế
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+    from utils.config import DB_CONFIG, RAW_JOBS_TABLE, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE, RAW_BATCH_SIZE
+    from utils.db import get_connection, execute_query, table_exists, get_dataframe, execute_stored_procedure, execute_sql_file
+
+# from data_processing import clean_title, clean_company_name, extract_location_info, refine_location
+try:
+    from src.processing.data_processing import clean_title, clean_company_name, extract_location_info, refine_location
+except ImportError:
+    from processing.data_processing import clean_title, clean_company_name, extract_location_info, refine_location
+
+# Đường dẫn đến thư mục SQL
+SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
+if not os.path.exists(SQL_DIR):
+    SQL_DIR = os.path.join(os.getcwd(), "sql")
+    os.makedirs(SQL_DIR, exist_ok=True)
+
+def setup_database_schema():
+    """Thiết lập schema và bảng"""
+    try:
+        # Kiểm tra và tạo schema nếu chưa tồn tại
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                # Kiểm tra schema đã tồn tại chưa
+                cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM information_schema.schemata 
+                    WHERE schema_name = %s
+                );
+                """, (DWH_STAGING_SCHEMA,))
+                schema_exists = cursor.fetchone()[0]
+                
+                if not schema_exists:
+                    logger.info(f"Schema {DWH_STAGING_SCHEMA} chưa tồn tại, đang tạo mới...")
+                    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {DWH_STAGING_SCHEMA};")
+                    conn.commit()
+                    logger.info(f"Đã tạo schema {DWH_STAGING_SCHEMA}")
+                else:
+                    logger.info(f"Schema {DWH_STAGING_SCHEMA} đã tồn tại")
+
+        # Thực thi file schema_staging.sql để thiết lập bảng và chỉ mục
+        schema_staging = os.path.join(SQL_DIR, "schema_staging.sql")
+        if os.path.exists(schema_staging):
+            if not execute_sql_file(schema_staging):
+                logger.error("Không thể thiết lập schema và bảng!")
+                return False
+        else:
+            logger.error(f"Không tìm thấy file schema: {schema_staging}")
+            return False
+        
+        logger.info("Đã thiết lập schema và bảng database thành công!")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi thiết lập schema database: {str(e)}")
+        return False
+
+def run_stored_procedures():
+    """Thực thi stored procedures"""
+    try:
+        logger.info("Đang thực thi stored procedures...")
+        
+        # Thực thi file stored procedures để đảm bảo các hàm đã được tạo
+        stored_procs_file = os.path.join(SQL_DIR, "stored_procedures.sql")
+        if os.path.exists(stored_procs_file):
+            if not execute_sql_file(stored_procs_file):
+                logger.error("Không thể tạo stored procedures!")
+                return False
+        else:
+            logger.error(f"Không tìm thấy file stored procedures: {stored_procs_file}")
+            return False
+        
+        # Gọi stored procedure cập nhật deadline
+        try:
+            logger.info("Thực thi stored procedure update_deadline...")
+            execute_stored_procedure('update_deadline')
+            logger.info("Đã cập nhật thành công thời gian còn lại")
+            
+            # Có thể thêm các stored procedures khác nếu cần
+            
+            return True
+        except Exception as e:
+            logger.error(f"Lỗi khi thực thi stored procedure: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Lỗi khi thực thi stored procedures: {e}")
+        return False
+
+def load_staging_data(limit=None, offset=0):
+    """
+    Load dữ liệu từ bảng staging_jobs vào DataFrame
+    
+    Args:
+        limit: Giới hạn số bản ghi cần lấy
+        offset: Vị trí bắt đầu
+        
+    Returns:
+        DataFrame chứa dữ liệu từ staging_jobs
+    """
+    try:
+        # Sửa lại tên bảng để tránh lặp lại schema
+        table_name = f"{STAGING_JOBS_TABLE}" 
+        logger.info(f"Đang tải dữ liệu từ bảng {table_name}...")
+        
+        # Xây dựng query
+        query = f"SELECT * FROM {table_name}"
+        if limit is not None:
+            query += f" LIMIT {limit}"
+        if offset > 0:
+            query += f" OFFSET {offset}"
+        
+        # Lấy dữ liệu
+        df = get_dataframe(query)
+        logger.info(f"Đã tải thành công {len(df)} bản ghi từ bảng {table_name}")
+        return df
+    except Exception as e:
+        logger.error(f"Lỗi khi tải dữ liệu từ {table_name}: {e}")
+        raise
+
+def save_back_to_staging(df):
+    """
+    Lưu DataFrame đã xử lý trở lại bảng staging_jobs
+    
+    Args:
+        df: DataFrame đã xử lý
+        
+    Returns:
+        bool: Kết quả thực hiện
+    """
+    try:
+        # Sửa lại tên bảng để tránh lặp lại schema
+        table_name = f"{DWH_STAGING_SCHEMA}.staging_jobs"
+        logger.info(f"Đang lưu {len(df)} bản ghi vào bảng {table_name}...")
+        
+        # Cách đơn giản hơn sử dụng upsert trực tiếp
+        from sqlalchemy import create_engine, text
+        engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+        
+        # Tạo một bản sao để tránh sửa đổi df gốc
+        df_to_save = df.copy()
+        
+        # Xử lý các cột kiểu JSONB
+        for col in ['skills', 'location_pairs', 'raw_data']:
+            if col in df_to_save.columns:
+                df_to_save[col] = df_to_save[col].apply(
+                    lambda x: json.dumps(x) if isinstance(x, (list, dict)) else 
+                             (None if pd.isna(x) else json.dumps(x))
+                )
+        
+        # Tạo temporary table trong phiên làm việc hiện tại
+        with engine.begin() as conn:
+            # Tạo bảng tạm
+            conn.execute(text("DROP TABLE IF EXISTS temp_staging_jobs"))
+            conn.execute(text(f"CREATE TABLE temp_staging_jobs (LIKE {table_name})"))
+            
+            # Lưu DataFrame vào bảng tạm
+            df_to_save.to_sql('temp_staging_jobs', conn, if_exists='append', index=False)
+            
+            # Thực hiện upsert từ bảng tạm vào bảng chính
+            update_columns = [c for c in df_to_save.columns if c != 'job_id']
+            update_stmt = ", ".join([f"{col} = excluded.{col}" for col in update_columns])
+            
+            upsert_query = f"""
+            INSERT INTO {table_name}
+            SELECT * FROM temp_staging_jobs
+            ON CONFLICT (job_id) 
+            DO UPDATE SET {update_stmt}
+            """
+            
+            # Thực thi upsert
+            conn.execute(text(upsert_query))
+            
+            # Xóa bảng tạm
+            conn.execute(text("DROP TABLE IF EXISTS temp_staging_jobs"))
+        
+        logger.info(f"Đã cập nhật thành công {len(df)} bản ghi vào bảng {table_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi lưu dữ liệu vào bảng {table_name}: {e}")
+        return False
+
+# Hàm xử lý dữ liệu
+def process_staging_data(df):
+    """
+    Xử lý tất cả các trường dữ liệu cần thiết bằng pandas
+    
+    Args:
+        df: DataFrame từ staging_jobs
+        
+    Returns:
+        DataFrame đã xử lý
+    """
+    # Tạo bản sao để tránh ảnh hưởng đến dữ liệu gốc
+    processed_df = df.copy()
+    
+    # 1. Xử lý location
+    logger.info("Đang xử lý location...")
+    if 'location_detail' in processed_df.columns:
+        processed_df['location_pairs'] = processed_df['location_detail'].apply(extract_location_info)
+    
+    if 'location' in processed_df.columns and 'location_pairs' in processed_df.columns:
+        processed_df['location'] = processed_df.apply(refine_location, axis=1)
+    
+    # 2. Xử lý title
+    logger.info("Đang xử lý title...")
+    if 'title' in processed_df.columns:
+        processed_df['title_clean'] = processed_df['title'].apply(clean_title)
+    
+    # 3. Xử lý company_name
+    logger.info("Đang xử lý company_name...")
+    if 'company_name' in processed_df.columns:
+        processed_df['company_name_standardized'] = processed_df['company_name'].apply(clean_company_name)
+    
+    logger.info(f"Đã hoàn thành xử lý chi tiết cho {len(processed_df)} bản ghi")
+    return processed_df
+
+def run_etl():
+    """
+    Thực hiện quy trình ETL hoàn chỉnh
+    
+    Returns:
+        bool: Kết quả thực hiện
+    """
+    try:
+        logger.info("Bắt đầu quy trình ETL...")
+        
+        # 1. Thiết lập schema và bảng nếu cần
+        if not setup_database_schema():
+            logger.error("Không thể thiết lập schema và bảng!")
+            return False
+        
+        # 2. Chạy stored procedures để xử lý dữ liệu cơ bản
+        if not run_stored_procedures():
+            logger.warning("Có lỗi khi thực thi stored procedures!")
+            # Vẫn tiếp tục vì có thể một số SP đã chạy thành công
+        
+        # 3. Load dữ liệu từ staging để xử lý thêm bằng pandas
+        staging_df = load_staging_data()
+        
+        # 4. Xử lý chi tiết bằng pandas
+        processed_df = process_staging_data(staging_df)
+        
+        # 5. Lưu kết quả trở lại bảng staging
+        if not save_back_to_staging(processed_df):
+            logger.error("Không thể lưu kết quả vào bảng staging!")
+            return False
+        
+        logger.info("Quy trình ETL đã hoàn thành thành công!")
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi trong quy trình ETL: {e}")
+        return False
+
+# Hàm main
+if __name__ == "__main__":
+    try:
+        import argparse
+        
+        # Tạo parser
+        parser = argparse.ArgumentParser(description="Job Data ETL Process")
+        parser.add_argument("--limit", type=int, help="Giới hạn số bản ghi xử lý")
+        parser.add_argument("--verbose", "-v", action="store_true", help="Hiển thị thông tin chi tiết")
+        
+        args = parser.parse_args()
+        
+        # Thiết lập logging level
+        if args.verbose:
+            logger.setLevel(logging.DEBUG)
+            for handler in logger.handlers:
+                handler.setLevel(logging.DEBUG)
+        
+        # Thực thi ETL
+        success = run_etl()
+        
+        if success:
+            print("✅ Quy trình ETL đã hoàn thành thành công!")
+            sys.exit(0)
+        else:
+            print("❌ Quy trình ETL thất bại!")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Lỗi không xác định: {e}")
+        print(f"❌ Lỗi không xác định: {e}")
+        sys.exit(1)
+
