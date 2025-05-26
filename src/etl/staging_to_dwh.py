@@ -3,17 +3,16 @@
 
 """
 ETL module cho việc chuyển dữ liệu từ Staging sang Data Warehouse (DuckDB)
+Fixed version với logic parsing location mới
 """
-
+import pandas as pd
+import logging
+import json
 import os
 import sys
-import json
-import argparse
+import duckdb
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
-import logging
-import pandas as pd
-import duckdb
 
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,9 +39,9 @@ from src.utils.db import get_connection, get_dataframe, execute_query
 from src.utils.config import DUCKDB_PATH, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE
 
 try:
-    from src.processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range
+    from src.processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range, parse_single_location_item, parse_job_location
 except ImportError:
-    from processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range
+    from processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range, parse_single_location_item, parse_job_location
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
@@ -167,6 +166,62 @@ def get_staging_batch(last_etl_date: datetime) -> pd.DataFrame:
         # Trả về DataFrame rỗng trong trường hợp lỗi
         return pd.DataFrame()
     
+def lookup_location_key(
+    duck_conn: duckdb.DuckDBPyConnection,
+    province: str = None,
+    city: str = None,
+    district: str = None
+) -> Optional[int]:
+    """
+    Tìm location_sk từ bảng DimLocation dựa trên province, city, district
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        province: Tên tỉnh
+        city: Tên thành phố
+        district: Tên quận/huyện
+    
+    Returns:
+        location_sk hoặc None nếu không tìm thấy
+    """
+    try:
+        # Xây dựng query động dựa trên các tham số có giá trị
+        conditions = ["is_current = TRUE"]
+        params = []
+        
+        if province is not None:
+            conditions.append("province = ?")
+            params.append(province)
+        else:
+            conditions.append("province IS NULL")
+            
+        if city is not None:
+            conditions.append("city = ?")
+            params.append(city)
+        else:
+            conditions.append("city IS NULL")
+            
+        if district is not None:
+            conditions.append("district = ?")
+            params.append(district)
+        else:
+            conditions.append("district IS NULL")
+        
+        query = f"""
+            SELECT location_sk
+            FROM DimLocation
+            WHERE {' AND '.join(conditions)}
+            LIMIT 1
+        """
+        
+        result = duck_conn.execute(query, params).fetchone()
+        if result:
+            return result[0]
+        return None
+    except Exception as e:
+        logger.error(f"Lỗi khi tìm location_sk: {e}")
+        return None
+
 def lookup_dimension_key(
     duck_conn: duckdb.DuckDBPyConnection,
     dim_table: str,
@@ -277,32 +332,56 @@ def generate_fact_records(
             fact_id = result[0]
             fact_records.append(fact_record)
             
-            # Xử lý locations
-            if pd.isna(job.location):
-                # Nếu không có location, thêm Unknown
-                location_sk = lookup_dimension_key(
-                    duck_conn, 'DimLocation', 'location', 'Unknown', 'location_sk'
-                )
-                if location_sk:
-                    bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
+            # Xử lý locations với cấu trúc mới (province, city, district)
+            location_str = None
+            
+            # Ưu tiên sử dụng location_pairs nếu có
+            if hasattr(job, 'location_pairs'):
+                try:
+                    location_pairs_value = getattr(job, 'location_pairs')
+                    if location_pairs_value is not None and str(location_pairs_value).lower() not in ['nan', 'none', '']:
+                        location_str = str(location_pairs_value)
+                except:
+                    pass
+                    
+            # Fallback về location nếu không có location_pairs
+            if not location_str and hasattr(job, 'location'):
+                try:
+                    location_value = getattr(job, 'location')
+                    if location_value is not None and str(location_value).lower() not in ['nan', 'none', '']:
+                        location_str = str(location_value)
+                except:
+                    pass
+            
+            if location_str:
+                # Parse location string thành các tuple (province, city, district)
+                logger.info(f"Parsing location_str: {location_str}")
+                parsed_locations = parse_job_location(location_str)
+                logger.info(f"Parsed locations: {parsed_locations}")
+                
+                for province, city, district in parsed_locations:
+                    location_sk = lookup_location_key(duck_conn, province, city, district)
+                    
+                    if location_sk:
+                        bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
+                    else:
+                        # Nếu không tìm thấy exact match, thử tìm Unknown
+                        unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
+                        if unknown_location_sk:
+                            bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
+                        else:
+                            logger.warning(f"Không tìm thấy location_sk cho job_id={job.job_id}, location=({province}, {city}, {district})")
             else:
-                # Tách locations từ string
-                if isinstance(job.location, str):
-                    for loc in job.location.split(','):
-                        location = loc.strip()
-                        if location:
-                            location_sk = lookup_dimension_key(
-                                duck_conn, 'DimLocation', 'location', location, 'location_sk'
-                            )
-                            if location_sk:
-                                bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
+                # Không có location, sử dụng Unknown
+                unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
+                if unknown_location_sk:
+                    bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
         
         except Exception as e:
             logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}: {e}")
             continue
     
     return fact_records, bridge_records
-
 
 
 if __name__ == "__main__":
@@ -316,7 +395,7 @@ if __name__ == "__main__":
         sys.exit(0)  # Thoát sớm nếu không có dữ liệu
 
     # 2. Có thể xóa file DuckDB cũ nếu cần (tùy chọn)
-    if os.path.exists(DUCKDB_PATH) and input("Xóa file DuckDB cũ? (y/n): ").lower() == 'y':
+    if os.path.exists(DUCKDB_PATH):
         os.remove(DUCKDB_PATH)
         logger.info(f"Đã xóa file DuckDB cũ: {DUCKDB_PATH}")
 
@@ -500,3 +579,7 @@ if __name__ == "__main__":
             logger.error(f"Lỗi khi insert vào FactJobLocationBridge: {e}")
             logger.error(f"Record: {bridge}")
     logger.info(f"Đã insert {len(bridge_records)} bản ghi vào FactJobLocationBridge")
+
+    # 6. Đóng kết nối
+    duck_conn.close()
+    logger.info("✅ ETL hoàn thành!")

@@ -2,6 +2,7 @@ import pandas as pd
 import logging
 import json
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
 import os
 import sys
 
@@ -112,142 +113,184 @@ def generate_date_range(start_date: datetime, end_date: datetime) -> pd.DataFram
     
     return pd.DataFrame(date_records)
 
+
 def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     """
     Chuẩn bị dữ liệu cho bảng DimLocation với xử lý province, city, district
-    Xử lý mỗi cặp location_pair tách biệt và xét trùng lặp dựa trên 3 cột: province, city, district
-    Tách các quận/huyện khi một thành phố có nhiều quận/huyện được liệt kê
+    
+    Logic xử lý:
+    1. Cặp "value1:value2" có 2 dạng:
+       - "province:city" (nhận biết bởi có "TP" trong value2)
+       - "city:district" (không có "TP" trong value2)
+    2. Dạng chỉ có "city" riêng lẻ
+    3. List nhiều cặp sẽ được tách từng cặp riêng biệt
+    4. Xét trùng lặp dựa trên 3 cột: (province, city, district)
     
     Args:
         staging_records: Dữ liệu từ staging
         
     Returns:
-        DataFrame cho DimLocation với unique province-city-district combinations
+        DataFrame cho DimLocation với unique (province, city, district) combinations
     """
     logger.info("Chuẩn bị dữ liệu cho DimLocation")
     locations = []
     
-    def parse_location_pair(pair):
-        """Helper function to parse location pair and extract province, city, district"""
+    def parse_location_pair(pair_str):
+        """
+        Parse location pair string và trả về (province, city, districts_list)
+        
+        Args:
+            pair_str: String dạng "value1:value2" hoặc "value"
+            
+        Returns:
+            tuple: (province, city, districts_list)
+        """
         province = None
         city = None
         districts = []
         
-        if isinstance(pair, str) and ":" in pair:
-            parts = pair.split(":", 1)
+        if not isinstance(pair_str, str) or not pair_str.strip():
+            return province, city, districts
+            
+        pair_str = pair_str.strip()
+        
+        if ":" in pair_str:
+            parts = pair_str.split(":", 1)
             if len(parts) == 2:
                 part1, part2 = parts[0].strip(), parts[1].strip()
                 
-                # Trường hợp "Tỉnh:Thành phố" khi có chữ "TP" trong phần sau
-                if "TP" in part2:
+                # Kiểm tra xem có phải "province:city" không (có "TP" trong part2)
+                if "TP" in part2.upper():
+                    # Dạng "Tỉnh ABC:TP XYZ"
                     province = part1
                     city = part2
-                # Trường hợp "Thành phố:Quận/huyện" khi không có chữ "TP"
+                    districts = []  # Không có district
                 else:
+                    # Dạng "City:District1, District2, ..."
                     city = part1
-                    # Kiểm tra và tách các quận/huyện nếu có nhiều, phân cách bằng dấu phẩy
+                    # Tách districts bằng dấu phẩy
                     if "," in part2:
                         districts = [d.strip() for d in part2.split(",") if d.strip()]
                     else:
-                        districts = [part2]
-        elif isinstance(pair, str):
-            # Trường hợp chỉ có tên thành phố
-            city = pair
+                        districts = [part2] if part2 else []
+        else:
+            # Chỉ có city riêng lẻ
+            city = pair_str
+            districts = []
         
         return province, city, districts
     
-    # Xử lý từng bản ghi staging
-    for _, record in staging_records.iterrows():
-        if pd.isna(record['location']):
-            continue
-            
-        # Xử lý location_pairs từ nhiều định dạng có thể có
+    def extract_location_pairs_list(record):
+        """Trích xuất danh sách location pairs từ record"""
         location_pairs_list = []
         
-        if isinstance(record['location_pairs'], list):
-            location_pairs_list = record['location_pairs']
-        elif isinstance(record['location_pairs'], dict):
-            location_pairs_list = [json.dumps(record['location_pairs'])]
-        elif isinstance(record['location_pairs'], str):
-            try:
-                parsed = json.loads(record['location_pairs'])
-                if isinstance(parsed, list):
-                    location_pairs_list = parsed
-                elif isinstance(parsed, dict):
-                    location_pairs_list = [json.dumps(parsed)]
-                else:
-                    location_pairs_list = [str(parsed)]
-            except json.JSONDecodeError:
-                if record['location_pairs']:
-                    location_pairs_list = [record['location_pairs']]
-        
-        # Không có location_pairs thì lấy location
-        if not location_pairs_list and isinstance(record['location'], str):
-            city_districts_map = {}
+        # Xử lý trường location_pairs nếu có
+        if 'location_pairs' in record:
+            location_pairs_value = record['location_pairs']
             
-            # Tách location string và kiểm tra cấu trúc "City │ District1, District2"
-            location_parts = record['location'].split("│")
-            if len(location_parts) == 2:
-                city = location_parts[0].strip()
-                districts_str = location_parts[1].strip()
-                districts = [d.strip() for d in districts_str.split(",") if d.strip()]
+            # Kiểm tra null an toàn
+            try:
+                is_null = pd.isna(location_pairs_value)
+                # Nếu là array, kiểm tra all null
+                if hasattr(is_null, '__len__') and len(is_null) > 1:
+                    is_null = is_null.all()
+            except (ValueError, TypeError):
+                # Fallback: check directly
+                is_null = location_pairs_value is None or str(location_pairs_value).lower() in ['nan', 'none', '']
+            
+            if not is_null:
+                if isinstance(location_pairs_value, list):
+                    # Đã là list
+                    location_pairs_list = location_pairs_value
+                elif isinstance(location_pairs_value, str):
+                    try:
+                        # Thử parse JSON
+                        parsed = json.loads(location_pairs_value)
+                        if isinstance(parsed, list):
+                            location_pairs_list = parsed
+                        else:
+                            location_pairs_list = [str(parsed)]
+                    except json.JSONDecodeError:
+                        # Không phải JSON, coi như string thường
+                        location_pairs_list = [location_pairs_value]
+                else:
+                    # Các kiểu khác, convert thành string
+                    location_pairs_list = [str(location_pairs_value)]
+        
+        # Nếu không có location_pairs hoặc rỗng, dùng trường location
+        if not location_pairs_list and 'location' in record:
+            location_value = record['location']
+            
+            # Kiểm tra null an toàn cho location
+            try:
+                is_null = pd.isna(location_value)
+                if hasattr(is_null, '__len__') and len(is_null) > 1:
+                    is_null = is_null.all()
+            except (ValueError, TypeError):
+                is_null = location_value is None or str(location_value).lower() in ['nan', 'none', '']
+            
+            if not is_null:
+                location_value = str(location_value).strip()
                 
-                # Tạo một entry cho mỗi district
+                # Kiểm tra định dạng "City │ District1, District2"
+                if "│" in location_value:
+                    location_parts = location_value.split("│", 1)
+                    if len(location_parts) == 2:
+                        city = location_parts[0].strip()
+                        districts_str = location_parts[1].strip()
+                        # Tạo các cặp "city:district"
+                        if "," in districts_str:
+                            for district in districts_str.split(","):
+                                if district.strip():
+                                    location_pairs_list.append(f"{city}:{district.strip()}")
+                        else:
+                            location_pairs_list.append(f"{city}:{districts_str}")
+                    else:
+                        location_pairs_list = [location_value]
+                else:
+                    # Chỉ có city
+                    location_pairs_list = [location_value]
+        
+        return location_pairs_list
+    
+    # Xử lý từng bản ghi staging
+    for _, record in staging_records.iterrows():
+        location_pairs_list = extract_location_pairs_list(record)
+        
+        if not location_pairs_list:
+            # Không có dữ liệu location nào
+            continue
+        
+        # Xử lý từng location pair
+        for pair_str in location_pairs_list:
+            province, city, districts = parse_location_pair(pair_str)
+            
+            if not city:
+                # Không có city, bỏ qua
+                continue
+            
+            if districts:
+                # Có districts, tạo một record cho mỗi district
                 for district in districts:
                     locations.append({
-                        'location': f"{city} - {district}",
-                        'location_detail': record.get('location_detail'),
-                        'location_pairs': None,
-                        'province': None,
+                        'province': province,
                         'city': city,
                         'district': district
                     })
             else:
-                # Không có định dạng đặc biệt, xem như là thành phố
+                # Không có district, tạo record với district = None
                 locations.append({
-                    'location': record['location'],
-                    'location_detail': record.get('location_detail'),
-                    'location_pairs': None,
-                    'province': None,
-                    'city': record['location'],
+                    'province': province,
+                    'city': city,
                     'district': None
                 })
-        
-        # Xử lý mỗi location_pair riêng biệt
-        for pair in location_pairs_list:
-            province, city, districts = parse_location_pair(pair)
-            
-            # Với mỗi district, tạo một bản ghi riêng
-            if city:
-                if districts:
-                    for district in districts:
-                        locations.append({
-                            'location': f"{city} - {district}",
-                            'location_detail': record.get('location_detail'),
-                            'location_pairs': json.dumps([pair]) if pair else None,
-                            'province': province,
-                            'city': city,
-                            'district': district
-                        })
-                else:
-                    # Khfrom datetime import datetime, timedelta ông có district
-                    locations.append({
-                        'location': city,
-                        'location_detail': record.get('location_detail'),
-                        'location_pairs': json.dumps([pair]) if pair else None,
-                        'province': province,
-                        'city': city,
-                        'district': None
-                    })
     
     # Tạo DataFrame
     if not locations:
+        # Nếu không có dữ liệu nào, tạo record Unknown
         locations.append({
-            'location': 'Unknown', 
-            'location_detail': None, 
-            'location_pairs': None,
             'province': None,
-            'city': None,
+            'city': 'Unknown',
             'district': None
         })
     
@@ -258,9 +301,139 @@ def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     location_df['effective_date'] = today
     location_df['is_current'] = True
     
-    # Loại bỏ duplicate dựa trên province, city, district
-    location_df = location_df.drop_duplicates(subset=['province', 'city', 'district'])
+    # Loại bỏ duplicate dựa trên (province, city, district)
+    location_df = location_df.drop_duplicates(subset=['province', 'city', 'district'], keep='first')
     
-    logger.info(f"Đã chuẩn bị {len(location_df)} bản ghi DimLocation")
+    logger.info(f"Đã chuẩn bị {len(location_df)} bản ghi DimLocation unique")
+    
+    # Log thống kê để debug
+    logger.info("Thống kê DimLocation:")
+    logger.info(f"  - Có province: {location_df['province'].notna().sum()}")
+    logger.info(f"  - Có city: {location_df['city'].notna().sum()}")
+    logger.info(f"  - Có district: {location_df['district'].notna().sum()}")
+    
+    # Log một vài examples
+    logger.info("Một vài ví dụ DimLocation:")
+    for i, row in location_df.head(10).iterrows():
+        logger.info(f"  {row['province']} | {row['city']} | {row['district']}")
+    
     return location_df
 
+def parse_single_location_item(item: str) -> List[Tuple[str, str, str]]:
+    """
+    Parse một location item riêng lẻ thành các tuple (province, city, district)
+    
+    Xử lý patterns:
+    - "Hà Nội: Thanh Xuân, Đống Đa" -> [(None, 'Hà Nội', 'Thanh Xuân'), (None, 'Hà Nội', 'Đống Đa')]
+    - "Hà Nội: Cầu Giấy" -> [(None, 'Hà Nội', 'Cầu Giấy')]
+    - "Hồ Chí Minh" -> [(None, 'Hồ Chí Minh', None)]
+    - "Bình Định: TP Quy Nhơn" -> [('Bình Định', 'TP Quy Nhơn', None)]
+    """
+    locations = []
+    
+    # Xử lý định dạng "City │ District" hoặc "Province │ City │ District"
+    if "│" in item:
+        segments = [seg.strip() for seg in item.split("│") if seg.strip()]
+        if len(segments) == 2:
+            # Dạng "City │ District"
+            locations.append((None, segments[0], segments[1]))
+        elif len(segments) == 3:
+            # Dạng "Province │ City │ District"
+            locations.append((segments[0], segments[1], segments[2]))
+        elif len(segments) == 1:
+            # Chỉ có 1 phần
+            locations.append((None, segments[0], None))
+        else:
+            # Nhiều hơn 3 phần, lấy 3 phần đầu
+            locations.append((segments[0], segments[1], segments[2]))
+    
+    # Xử lý định dạng "Province:City" hoặc "City:District" 
+    elif ":" in item:
+        segments = item.split(":", 1)
+        if len(segments) == 2:
+            part1, part2 = segments[0].strip(), segments[1].strip()
+            
+            # Nếu part2 chứa dấu phẩy -> multiple districts trong cùng city/province
+            if "," in part2:
+                districts = [d.strip() for d in part2.split(",") if d.strip()]
+                for district in districts:
+                    # Kiểm tra xem có phải "province:city" không (có "TP" trong district)
+                    if "TP" in district.upper():
+                        locations.append((part1, district, None))
+                    else:
+                        # Dạng "City:District1, District2"
+                        locations.append((None, part1, district))
+            else:
+                # Single location sau dấu ":"
+                # Kiểm tra xem có phải "province:city" không (có "TP" trong part2)
+                if "TP" in part2.upper():
+                    locations.append((part1, part2, None))
+                else:
+                    # Dạng "City:District"
+                    locations.append((None, part1, part2))
+        else:
+            locations.append((None, item, None))
+    
+    else:
+        # Item đơn giản không có ":" hay "│"
+        locations.append((None, item, None))
+    
+    return locations
+
+def parse_job_location(location_str: str) -> List[Tuple[str, str, str]]:
+    """
+    Parse location string từ job thành list các tuple (province, city, district)
+    
+    Logic parsing MỚI:
+    1. Nếu array element chứa dấu phẩy -> tách districts trong cùng 1 city: 
+       "Hà Nội: Thanh Xuân, Đống Đa" -> [(None, 'Hà Nội', 'Thanh Xuân'), (None, 'Hà Nội', 'Đống Đa')]
+    2. Nếu array elements riêng biệt -> mỗi element là location độc lập:
+       ["Hà Nội: Đống Đa", "Hồ Chí Minh", "Bình Dương"] -> 3 locations riêng biệt
+    
+    Args:
+        location_str: String location từ job data
+        
+    Returns:
+        List các tuple (province, city, district)
+    """
+    locations = []
+    
+    if not isinstance(location_str, str) or not location_str.strip():
+        return [(None, 'Unknown', None)]
+    
+    # Parse JSON list nếu có
+    location_items = []
+    try:
+        import json
+        # Thử parse JSON trước
+        parsed_list = json.loads(location_str)
+        if isinstance(parsed_list, list):
+            location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
+        else:
+            location_items = [location_str.strip()]
+    except (json.JSONDecodeError, TypeError):
+        # Nếu không parse được JSON, thử parse format ['item1', 'item2'] bằng eval
+        try:
+            if location_str.strip().startswith('[') and location_str.strip().endswith(']'):
+                import ast
+                parsed_list = ast.literal_eval(location_str)
+                if isinstance(parsed_list, list):
+                    location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
+                else:
+                    location_items = [location_str.strip()]
+            else:
+                location_items = [location_str.strip()]
+        except (ValueError, SyntaxError):
+            location_items = [location_str.strip()]
+    
+    # Xử lý từng location item RIÊNG BIỆT - không dùng context cross-item
+    for item in location_items:
+        if not item or not item.strip():
+            continue
+        item = item.strip()
+        
+        # Parse 1 item - có thể chứa comma-separated districts
+        item_locations = parse_single_location_item(item)
+        locations.extend(item_locations)
+    
+    return locations if locations else [(None, 'Unknown', None)]
