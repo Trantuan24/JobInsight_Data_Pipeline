@@ -52,6 +52,7 @@ def prepare_dim_job(staging_records: pd.DataFrame) -> pd.DataFrame:
     # Thêm các cột cần thiết cho SCD Type 2
     today = datetime.now().date()
     dim_job_df['effective_date'] = today
+    dim_job_df['expiry_date'] = None
     dim_job_df['is_current'] = True
     
     logger.info(f"Đã chuẩn bị {len(dim_job_df)} bản ghi DimJob")
@@ -79,6 +80,7 @@ def prepare_dim_company(staging_records: pd.DataFrame) -> pd.DataFrame:
     # Thêm các cột cần thiết cho SCD Type 2
     today = datetime.now().date()
     company_df['effective_date'] = today
+    company_df['expiry_date'] = None
     company_df['is_current'] = True
     
     # Loại bỏ duplicate
@@ -86,6 +88,217 @@ def prepare_dim_company(staging_records: pd.DataFrame) -> pd.DataFrame:
     
     logger.info(f"Đã chuẩn bị {len(company_df)} bản ghi DimCompany")
     return company_df
+
+def check_dimension_changes(
+    duck_conn,
+    new_records: pd.DataFrame,
+    dim_table: str,
+    natural_key: str,
+    compare_columns: List[str]
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Kiểm tra thay đổi trong dimension table (SCD Type 2)
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        new_records: Dữ liệu mới cần kiểm tra
+        dim_table: Tên bảng dimension
+        natural_key: Cột natural key để so sánh
+        compare_columns: Các cột cần so sánh để detect changes
+    
+    Returns:
+        Tuple chứa (records_to_insert, records_to_update, unchanged_records)
+    """
+    records_to_insert = []
+    records_to_update = []
+    unchanged_records = []
+    
+    try:
+        for _, new_record in new_records.iterrows():
+            natural_key_value = new_record[natural_key]
+            
+            # Tìm bản ghi hiện tại trong dimension
+            query = f"""
+                SELECT * FROM {dim_table}
+                WHERE {natural_key} = ? AND is_current = TRUE
+            """
+            
+            existing = duck_conn.execute(query, [natural_key_value]).fetchdf()
+            
+            if existing.empty:
+                # Bản ghi mới hoàn toàn
+                records_to_insert.append(new_record)
+            else:
+                # So sánh các trường để xem có thay đổi không
+                existing_record = existing.iloc[0]
+                has_changes = False
+                
+                for col in compare_columns:
+                    if col in new_record.index and col in existing_record.index:
+                        old_val = existing_record[col]
+                        new_val = new_record[col]
+                        
+                        # Handle null values
+                        old_is_null = pd.isna(old_val) if old_val is not None else True
+                        new_is_null = pd.isna(new_val) if new_val is not None else True
+                        
+                        if old_is_null and new_is_null:
+                            continue
+                        elif old_is_null != new_is_null:
+                            has_changes = True
+                            break
+                        elif str(old_val) != str(new_val):
+                            has_changes = True
+                            break
+                
+                if has_changes:
+                    # Cần update: đóng record cũ và tạo record mới
+                    records_to_update.append({
+                        'old_record': existing_record,
+                        'new_record': new_record
+                    })
+                else:
+                    # Không có thay đổi
+                    unchanged_records.append(new_record)
+    
+    except Exception as e:
+        logger.error(f"Lỗi khi check dimension changes: {e}")
+        # Fallback: coi tất cả là insert mới
+        records_to_insert = new_records.to_dict('records')
+    
+    return (
+        pd.DataFrame(records_to_insert) if records_to_insert else pd.DataFrame(),
+        records_to_update,
+        pd.DataFrame(unchanged_records) if unchanged_records else pd.DataFrame()
+    )
+
+def apply_scd_type2_updates(duck_conn, dim_table: str, surrogate_key: str, updates: List[Dict]):
+    """
+    Áp dụng SCD Type 2 updates: đóng bản ghi cũ và tạo bản ghi mới
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        dim_table: Tên bảng dimension
+        surrogate_key: Tên cột surrogate key
+        updates: List các bản ghi cần update
+    """
+    today = datetime.now().date()
+    
+    for update_info in updates:
+        old_record = update_info['old_record']
+        new_record = update_info['new_record']
+        
+        try:
+            # 1. Đóng bản ghi cũ (set expiry_date và is_current = FALSE)
+            update_query = f"""
+                UPDATE {dim_table}
+                SET expiry_date = ?, is_current = FALSE
+                WHERE {surrogate_key} = ?
+            """
+            duck_conn.execute(update_query, [today, old_record[surrogate_key]])
+            
+            # 2. Insert bản ghi mới
+            new_record_dict = new_record.to_dict() if hasattr(new_record, 'to_dict') else new_record
+            
+            # Loại bỏ surrogate key để tự tạo
+            if surrogate_key in new_record_dict:
+                del new_record_dict[surrogate_key]
+            
+            # Đặt effective_date và is_current
+            new_record_dict['effective_date'] = today
+            new_record_dict['is_current'] = True
+            new_record_dict['expiry_date'] = None
+            
+            # Insert
+            columns = list(new_record_dict.keys())
+            placeholders = ', '.join(['?'] * len(columns))
+            values = [new_record_dict[col] for col in columns]
+            
+            # Handle JSON values
+            for i, val in enumerate(values):
+                if isinstance(val, (dict, list)):
+                    values[i] = json.dumps(val)
+            
+            insert_query = f"""
+                INSERT INTO {dim_table} ({', '.join(columns)})
+                VALUES ({placeholders})
+            """
+            duck_conn.execute(insert_query, values)
+            
+            logger.info(f"Updated {dim_table}: closed old record {old_record[surrogate_key]} and created new record")
+            
+        except Exception as e:
+            logger.error(f"Lỗi khi apply SCD2 update cho {dim_table}: {e}")
+
+def generate_daily_fact_records(
+    posted_date: Optional[datetime], 
+    due_date: Optional[datetime],
+    current_date: datetime = None
+) -> List[datetime]:
+    """
+    Tạo danh sách các ngày cho fact records từ posted_date đến due_date
+    
+    Args:
+        posted_date: Ngày đăng job
+        due_date: Ngày hết hạn job
+        current_date: Ngày hiện tại (default: hôm nay)
+    
+    Returns:
+        List các ngày cần tạo fact records
+    """
+    if current_date is None:
+        current_date = datetime.now()
+    
+    dates = []
+    
+    # Xác định start_date và end_date
+    if posted_date is not None:
+        start_date = posted_date.date() if hasattr(posted_date, 'date') else posted_date
+    else:
+        start_date = current_date.date()
+    
+    if due_date is not None:
+        end_date = due_date.date() if hasattr(due_date, 'date') else due_date
+    else:
+        # Nếu không có due_date, giả sử job có hiệu lực 30 ngày
+        end_date = start_date + timedelta(days=30)
+    
+    # Đảm bảo không tạo fact cho quá khứ xa hoặc tương lai xa
+    min_date = (current_date - timedelta(days=90)).date()
+    max_date = (current_date + timedelta(days=365)).date()
+    
+    start_date = max(start_date, min_date)
+    end_date = min(end_date, max_date)
+    
+    # Tạo list các ngày
+    current = start_date
+    while current <= end_date:
+        dates.append(current)
+        current += timedelta(days=1)
+    
+    return dates
+
+def calculate_load_month(date_value: Any) -> str:
+    """
+    Tính toán load_month từ date value
+    
+    Args:
+        date_value: Giá trị date (có thể là datetime, date, hoặc string)
+    
+    Returns:
+        String dạng YYYY-MM
+    """
+    try:
+        if date_value is None:
+            date_value = datetime.now()
+        elif isinstance(date_value, str):
+            date_value = pd.to_datetime(date_value)
+        elif hasattr(date_value, 'date'):
+            date_value = date_value
+        
+        return date_value.strftime('%Y-%m')
+    except:
+        return datetime.now().strftime('%Y-%m')
 
 def generate_date_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
     """
@@ -299,6 +512,7 @@ def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     # Thêm các cột cần thiết cho SCD Type 2
     today = datetime.now().date()
     location_df['effective_date'] = today
+    location_df['expiry_date'] = None
     location_df['is_current'] = True
     
     # Loại bỏ duplicate dựa trên (province, city, district)

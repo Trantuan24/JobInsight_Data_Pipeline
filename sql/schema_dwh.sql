@@ -26,12 +26,9 @@ CREATE TABLE IF NOT EXISTS DimCompany (
 
 CREATE TABLE IF NOT EXISTS DimLocation (
     location_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
-    location VARCHAR(100) NOT NULL,
-    location_detail TEXT,
-    location_pairs JSON,
-    province VARCHAR(20),
-    city VARCHAR(20),
-    district VARCHAR(20),
+    province VARCHAR(100),
+    city VARCHAR(100) NOT NULL,
+    district VARCHAR(100),
     effective_date DATE NOT NULL,
     expiry_date DATE,
     is_current BOOLEAN NOT NULL DEFAULT TRUE
@@ -59,6 +56,7 @@ CREATE TABLE IF NOT EXISTS FactJobPostingDaily (
     verified_employer BOOLEAN,
     posted_time TIMESTAMP,
     crawled_at TIMESTAMP,
+    load_month VARCHAR(7) NOT NULL,
     FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
     FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
     FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
@@ -77,6 +75,8 @@ CREATE INDEX IF NOT EXISTS idx_dimjob_current ON DimJob(is_current);
 CREATE INDEX IF NOT EXISTS idx_dimcompany_current ON DimCompany(is_current);
 CREATE INDEX IF NOT EXISTS idx_dimlocation_current ON DimLocation(is_current);
 CREATE INDEX IF NOT EXISTS idx_fact_date ON FactJobPostingDaily(date_id);
+CREATE INDEX IF NOT EXISTS idx_fact_load_month ON FactJobPostingDaily(load_month);
+CREATE INDEX IF NOT EXISTS idx_fact_job_date ON FactJobPostingDaily(job_sk, date_id);
 
 -- PHẦN 3: TẠO VIEWS
 CREATE VIEW IF NOT EXISTS vw_current_jobs AS
@@ -88,7 +88,7 @@ WHERE j.is_current = TRUE
 AND c.is_current = TRUE;
 
 CREATE VIEW IF NOT EXISTS vw_job_locations AS
-SELECT f.fact_id, f.job_sk, f.date_id, l.location, l.location_detail
+SELECT f.fact_id, f.job_sk, f.date_id, l.province, l.city, l.district
 FROM FactJobPostingDaily f
 JOIN FactJobLocationBridge b ON f.fact_id = b.fact_id
 JOIN DimLocation l ON b.location_sk = l.location_sk

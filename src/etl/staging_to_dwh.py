@@ -39,9 +39,19 @@ from src.utils.db import get_connection, get_dataframe, execute_query
 from src.utils.config import DUCKDB_PATH, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE
 
 try:
-    from src.processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range, parse_single_location_item, parse_job_location
+    from src.processing.data_prepare import (
+        prepare_dim_job, prepare_dim_company, prepare_dim_location, 
+        generate_date_range, parse_single_location_item, parse_job_location,
+        check_dimension_changes, apply_scd_type2_updates, 
+        generate_daily_fact_records, calculate_load_month
+    )
 except ImportError:
-    from processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location, generate_date_range, parse_single_location_item, parse_job_location
+    from processing.data_prepare import (
+        prepare_dim_job, prepare_dim_company, prepare_dim_location, 
+        generate_date_range, parse_single_location_item, parse_job_location,
+        check_dimension_changes, apply_scd_type2_updates, 
+        generate_daily_fact_records, calculate_load_month
+    )
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
@@ -259,6 +269,129 @@ def lookup_dimension_key(
         logger.error(f"Lỗi khi tìm khóa trong {dim_table}: {e}")
         return None
 
+def batch_insert_records(duck_conn: duckdb.DuckDBPyConnection, table_name: str, records: List[Dict], batch_size: int = 1000):
+    """
+    Batch insert records để tối ưu performance
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        table_name: Tên bảng
+        records: List các records cần insert
+        batch_size: Kích thước batch
+    """
+    if not records:
+        return 0
+        
+    inserted_count = 0
+    
+    # Chia records thành các batch
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        
+        try:
+            # Chuẩn bị dữ liệu batch
+            df_batch = pd.DataFrame(batch)
+            
+            # Handle JSON columns
+            for col in df_batch.columns:
+                df_batch[col] = df_batch[col].apply(
+                    lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x
+                )
+            
+            # Insert batch
+            duck_conn.execute(f"INSERT INTO {table_name} SELECT * FROM df_batch")
+            inserted_count += len(batch)
+            
+        except Exception as e:
+            logger.warning(f"Lỗi khi batch insert vào {table_name}: {e}")
+            # Fallback: insert từng record
+            for record in batch:
+                try:
+                    columns = list(record.keys())
+                    placeholders = ', '.join(['?'] * len(columns))
+                    values = [record[col] for col in columns]
+                    
+                    # Handle JSON values
+                    for j, val in enumerate(values):
+                        if isinstance(val, (dict, list)):
+                            values[j] = json.dumps(val)
+                    
+                    query = f"""
+                        INSERT INTO {table_name} ({', '.join(columns)})
+                        VALUES ({placeholders})
+                    """
+                    duck_conn.execute(query, values)
+                    inserted_count += 1
+                except Exception as e2:
+                    logger.error(f"Lỗi khi insert single record vào {table_name}: {e2}")
+    
+    logger.info(f"Đã batch insert {inserted_count} records vào {table_name}")
+    return inserted_count
+
+def process_dimension_with_scd2(
+    duck_conn: duckdb.DuckDBPyConnection,
+    staging_records: pd.DataFrame,
+    dim_table: str,
+    prepare_function,
+    natural_key: str,
+    surrogate_key: str,
+    compare_columns: List[str]
+) -> Dict[str, int]:
+    """
+    Xử lý dimension table với SCD Type 2
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        staging_records: Dữ liệu staging
+        dim_table: Tên bảng dimension
+        prepare_function: Function chuẩn bị dữ liệu
+        natural_key: Natural key column
+        surrogate_key: Surrogate key column
+        compare_columns: Columns để so sánh thay đổi
+    
+    Returns:
+        Dict thống kê insert/update
+    """
+    logger.info(f"Xử lý {dim_table} với SCD Type 2")
+    
+    # Chuẩn bị dữ liệu
+    prepared_data = prepare_function(staging_records)
+    
+    if prepared_data.empty:
+        logger.warning(f"Không có dữ liệu để xử lý cho {dim_table}")
+        return {'inserted': 0, 'updated': 0, 'unchanged': 0}
+    
+    # Kiểm tra thay đổi
+    to_insert, to_update, unchanged = check_dimension_changes(
+        duck_conn, prepared_data, dim_table, natural_key, compare_columns
+    )
+    
+    stats = {
+        'inserted': 0,
+        'updated': 0,
+        'unchanged': len(unchanged)
+    }
+    
+    # Áp dụng updates (SCD Type 2)
+    if to_update:
+        apply_scd_type2_updates(duck_conn, dim_table, surrogate_key, to_update)
+        stats['updated'] = len(to_update)
+    
+    # Insert records mới
+    if not to_insert.empty:
+        insert_records = []
+        for _, record in to_insert.iterrows():
+            record_dict = record.to_dict()
+            # Loại bỏ surrogate key
+            if surrogate_key in record_dict:
+                del record_dict[surrogate_key]
+            insert_records.append(record_dict)
+        
+        stats['inserted'] = batch_insert_records(duck_conn, dim_table, insert_records)
+    
+    logger.info(f"{dim_table} - Inserted: {stats['inserted']}, Updated: {stats['updated']}, Unchanged: {stats['unchanged']}")
+    return stats
+
 def generate_fact_records(
     duck_conn: duckdb.DuckDBPyConnection,
     staging_records: pd.DataFrame
@@ -293,93 +426,101 @@ def generate_fact_records(
             continue
         
         # Xử lý ngày
-        today = datetime.now().date()
-        due_date = pd.to_datetime(job.due_date).date() if pd.notna(job.due_date) else None
+        due_date = pd.to_datetime(job.due_date) if pd.notna(job.due_date) else None
         posted_time = pd.to_datetime(job.posted_time) if pd.notna(job.posted_time) else None
+        crawled_at = pd.to_datetime(job.crawled_at) if pd.notna(job.crawled_at) else datetime.now()
         
-        # Tạo bản ghi fact
-        fact_record = {
-            'job_sk': job_sk,
-            'company_sk': company_sk,
-            'date_id': today,
-            'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
-            'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
-            'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
-            'due_date': due_date,
-            'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
-            'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
-            'posted_time': posted_time,
-            'crawled_at': pd.to_datetime(job.crawled_at) if pd.notna(job.crawled_at) else datetime.now()
-        }
+        # Tạo danh sách các ngày cần tạo fact records
+        daily_dates = generate_daily_fact_records(posted_time, due_date)
         
-        # Insert fact record và lấy fact_id
-        columns = ', '.join([k for k, v in fact_record.items() if v is not None])
-        placeholders = ', '.join(['?'] * len([v for v in fact_record.values() if v is not None]))
-        values = [v for v in fact_record.values() if v is not None]
+        # Tính load_month
+        load_month = calculate_load_month(crawled_at)
         
-        insert_query = f"""
-            INSERT INTO FactJobPostingDaily ({columns})
-            VALUES ({placeholders})
-            RETURNING fact_id
-        """
+        # Tạo fact records cho từng ngày
+        for date_id in daily_dates:
+            fact_record = {
+                'job_sk': job_sk,
+                'company_sk': company_sk,
+                'date_id': date_id,
+                'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
+                'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
+                'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
+                'due_date': due_date,
+                'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
+                'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
+                'posted_time': posted_time,
+                'crawled_at': crawled_at,
+                'load_month': load_month
+            }
         
-        try:
-            result = duck_conn.execute(insert_query, values).fetchone()
-            if not result:
-                logger.warning(f"Không thể insert fact record cho job_id={job.job_id}")
-                continue
-                
-            fact_id = result[0]
-            fact_records.append(fact_record)
+            # Insert fact record và lấy fact_id
+            columns = ', '.join([k for k, v in fact_record.items() if v is not None])
+            placeholders = ', '.join(['?'] * len([v for v in fact_record.values() if v is not None]))
+            values = [v for v in fact_record.values() if v is not None]
             
-            # Xử lý locations với cấu trúc mới (province, city, district)
-            location_str = None
+            insert_query = f"""
+                INSERT INTO FactJobPostingDaily ({columns})
+                VALUES ({placeholders})
+                RETURNING fact_id
+            """
             
-            # Ưu tiên sử dụng location_pairs nếu có
-            if hasattr(job, 'location_pairs'):
-                try:
-                    location_pairs_value = getattr(job, 'location_pairs')
-                    if location_pairs_value is not None and str(location_pairs_value).lower() not in ['nan', 'none', '']:
-                        location_str = str(location_pairs_value)
-                except:
-                    pass
+            try:
+                result = duck_conn.execute(insert_query, values).fetchone()
+                if not result:
+                    logger.warning(f"Không thể insert fact record cho job_id={job.job_id}, date={date_id}")
+                    continue
                     
-            # Fallback về location nếu không có location_pairs
-            if not location_str and hasattr(job, 'location'):
-                try:
-                    location_value = getattr(job, 'location')
-                    if location_value is not None and str(location_value).lower() not in ['nan', 'none', '']:
-                        location_str = str(location_value)
-                except:
-                    pass
-            
-            if location_str:
-                # Parse location string thành các tuple (province, city, district)
-                logger.info(f"Parsing location_str: {location_str}")
-                parsed_locations = parse_job_location(location_str)
-                logger.info(f"Parsed locations: {parsed_locations}")
+                fact_id = result[0]
+                fact_records.append(fact_record)
                 
-                for province, city, district in parsed_locations:
-                    location_sk = lookup_location_key(duck_conn, province, city, district)
+                # Xử lý locations với cấu trúc mới (province, city, district)
+                location_str = None
+                
+                # Ưu tiên sử dụng location_pairs nếu có
+                if hasattr(job, 'location_pairs'):
+                    try:
+                        location_pairs_value = getattr(job, 'location_pairs')
+                        if location_pairs_value is not None and str(location_pairs_value).lower() not in ['nan', 'none', '']:
+                            location_str = str(location_pairs_value)
+                    except:
+                        pass
+                        
+                # Fallback về location nếu không có location_pairs
+                if not location_str and hasattr(job, 'location'):
+                    try:
+                        location_value = getattr(job, 'location')
+                        if location_value is not None and str(location_value).lower() not in ['nan', 'none', '']:
+                            location_str = str(location_value)
+                    except:
+                        pass
+                
+                if location_str:
+                    # Parse location string thành các tuple (province, city, district)
+                    logger.info(f"Parsing location_str: {location_str}")
+                    parsed_locations = parse_job_location(location_str)
+                    logger.info(f"Parsed locations: {parsed_locations}")
                     
-                    if location_sk:
-                        bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
-                    else:
-                        # Nếu không tìm thấy exact match, thử tìm Unknown
-                        unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
-                        if unknown_location_sk:
-                            bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
+                    for province, city, district in parsed_locations:
+                        location_sk = lookup_location_key(duck_conn, province, city, district)
+                        
+                        if location_sk:
+                            bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
                         else:
-                            logger.warning(f"Không tìm thấy location_sk cho job_id={job.job_id}, location=({province}, {city}, {district})")
-            else:
-                # Không có location, sử dụng Unknown
-                unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
-                if unknown_location_sk:
-                    bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
-        
-        except Exception as e:
-            logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}: {e}")
-            continue
+                            # Nếu không tìm thấy exact match, thử tìm Unknown
+                            unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
+                            if unknown_location_sk:
+                                bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
+                            else:
+                                logger.warning(f"Không tìm thấy location_sk cho job_id={job.job_id}, location=({province}, {city}, {district})")
+                else:
+                    # Không có location, sử dụng Unknown
+                    unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
+                    if unknown_location_sk:
+                        bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
+                        
+            except Exception as e:
+                logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}, date={date_id}: {e}")
+                continue
     
     return fact_records, bridge_records
 
@@ -405,120 +546,39 @@ if __name__ == "__main__":
     # 4. Kết nối DuckDB và thực hiện insert
     duck_conn = get_duckdb_connection(DUCKDB_PATH)
     
-    # 5. Xử lý và insert dữ liệu
+    # 5. Xử lý và insert dữ liệu với SCD Type 2
     dim_stats = {}
     
-    # 5.1 DimJob
-    logger.info("Xử lý DimJob")
-    dim_job_df = prepare_dim_job(staging_batch)
-    job_inserted = 0
-    
-    # Direct insert to DimJob
-    for _, job in dim_job_df.iterrows():
-        try:
-            job_dict = job.to_dict()
-            
-            # Loại bỏ cột job_sk để DuckDB tự tạo qua AUTOINCREMENT
-            if 'job_sk' in job_dict:
-                del job_dict['job_sk']
-            
-            # Lọc các cột vào đúng thứ tự và loại bỏ job_sk
-            columns = [col for col in job_dict.keys() if col != 'job_sk']
-            columns_str = ", ".join(columns)
-            placeholders = ", ".join(["?"] * len(columns))
-            values = [job_dict[col] for col in columns]
-            
-            # Đảm bảo các giá trị JSON được xử lý đúng
-            for i, val in enumerate(values):
-                if isinstance(val, (list, dict)):
-                    values[i] = json.dumps(val)
-            
-            query = f"""
-                INSERT INTO DimJob ({columns_str})
-                VALUES ({placeholders})
-            """
-            
-            duck_conn.execute(query, values)
-            job_inserted += 1
-        except Exception as e:
-            logger.error(f"Lỗi khi insert vào DimJob: {e}")
-            logger.error(f"Record: {job_dict}")
-    
-    dim_stats['DimJob'] = {'inserted': job_inserted}
-    logger.info(f"Đã insert {job_inserted} bản ghi vào DimJob")
+    # 5.1 DimJob với SCD Type 2
+    dim_stats['DimJob'] = process_dimension_with_scd2(
+        duck_conn, staging_batch, 'DimJob', prepare_dim_job,
+        'job_id', 'job_sk', ['title_clean', 'skills', 'job_url']
+    )
 
-    # 5.2. DimCompany
-    logger.info("Xử lý DimCompany")
-    dim_company_df = prepare_dim_company(staging_batch)
-    company_inserted = 0
-    
-    # Direct insert to DimCompany
-    for _, company in dim_company_df.iterrows():
-        try:
-            company_dict = company.to_dict()
-            
-            # Loại bỏ cột company_sk để DuckDB tự tạo qua AUTOINCREMENT
-            if 'company_sk' in company_dict:
-                del company_dict['company_sk']
-            
-            # Lọc các cột và loại bỏ company_sk
-            columns = [col for col in company_dict.keys() if col != 'company_sk']
-            columns_str = ", ".join(columns)
-            placeholders = ", ".join(["?"] * len(columns))
-            values = [company_dict[col] for col in columns]
-            
-            query = f"""
-                INSERT INTO DimCompany ({columns_str})
-                VALUES ({placeholders})
-            """
-            
-            duck_conn.execute(query, values)
-            company_inserted += 1
-        except Exception as e:
-            logger.error(f"Lỗi khi insert vào DimCompany: {e}")
-            logger.error(f"Record: {company_dict}")
-    
-    dim_stats['DimCompany'] = {'inserted': company_inserted}
-    logger.info(f"Đã insert {company_inserted} bản ghi vào DimCompany")
+    # 5.2. DimCompany với SCD Type 2
+    dim_stats['DimCompany'] = process_dimension_with_scd2(
+        duck_conn, staging_batch, 'DimCompany', prepare_dim_company,
+        'company_name_standardized', 'company_sk', ['company_url', 'verified_employer']
+    )
 
-    # 2.3. DimLocation
-    logger.info("Xử lý DimLocation")
+    # 5.3. DimLocation - xử lý đặc biệt vì composite key
+    logger.info("Xử lý DimLocation với composite key")
     dim_location_df = prepare_dim_location(staging_batch)
-    location_inserted = 0
-    
-    # Direct insert to DimLocation
-    for _, location in dim_location_df.iterrows():
-        try:
+    if not dim_location_df.empty:
+        location_records = []
+        for _, location in dim_location_df.iterrows():
             location_dict = location.to_dict()
-            
-            # Loại bỏ cột location_sk để DuckDB tự tạo qua AUTOINCREMENT
             if 'location_sk' in location_dict:
                 del location_dict['location_sk']
-            
-            # Lọc các cột và loại bỏ location_sk
-            columns = [col for col in location_dict.keys() if col != 'location_sk']
-            columns_str = ", ".join(columns)
-            placeholders = ", ".join(["?"] * len(columns))
-            values = [location_dict[col] for col in columns]
-            
-            # Xử lý các trường JSON
-            for i, val in enumerate(values):
-                if isinstance(val, (dict, list)):
-                    values[i] = json.dumps(val)
-            
-            query = f"""
-                INSERT INTO DimLocation ({columns_str})
-                VALUES ({placeholders})
-            """
-            
-            duck_conn.execute(query, values)
-            location_inserted += 1
-        except Exception as e:
-            logger.error(f"Lỗi khi insert vào DimLocation: {e}")
-            logger.error(f"Record: {location_dict}")
-    
-    dim_stats['DimLocation'] = {'inserted': location_inserted}
-    logger.info(f"Đã insert {location_inserted} bản ghi vào DimLocation")
+            location_records.append(location_dict)
+        
+        dim_stats['DimLocation'] = {
+            'inserted': batch_insert_records(duck_conn, 'DimLocation', location_records),
+            'updated': 0,
+            'unchanged': 0
+        }
+    else:
+        dim_stats['DimLocation'] = {'inserted': 0, 'updated': 0, 'unchanged': 0}
 
     # 5.4. Đảm bảo bảng DimDate có đầy đủ các ngày cần thiết
     logger.info("Xử lý DimDate")
@@ -526,37 +586,20 @@ if __name__ == "__main__":
     end_date = (datetime.now() + timedelta(days=240)).date()
     
     date_df = generate_date_range(start_date, end_date)
-    date_inserted = 0
     
-    # Direct insert to DimDate
+    # Filter out existing dates
+    new_date_records = []
     for _, date_record in date_df.iterrows():
-        try:
-            date_dict = date_record.to_dict()
-            
-            # Check if date already exists
-            exists = duck_conn.execute(f"SELECT 1 FROM DimDate WHERE date_id = ?", [date_dict['date_id']]).fetchone()
-            if exists:
-                continue
-            
-            # Insert
-            columns = ", ".join(date_dict.keys())
-            placeholders = ", ".join(["?"] * len(date_dict))
-            values = list(date_dict.values())
-            
-            query = f"""
-                INSERT INTO DimDate ({columns})
-                VALUES ({placeholders})
-            """
-            
-            duck_conn.execute(query, values)
-            date_inserted += 1
-        except Exception as e:
-            logger.error(f"Lỗi khi insert vào DimDate: {e}")
-            logger.error(f"Record: {date_dict}")
-            continue
+        date_dict = date_record.to_dict()
+        exists = duck_conn.execute(f"SELECT 1 FROM DimDate WHERE date_id = ?", [date_dict['date_id']]).fetchone()
+        if not exists:
+            new_date_records.append(date_dict)
     
-    dim_stats['DimDate'] = {'inserted': date_inserted}
-    logger.info(f"Đã insert {date_inserted} bản ghi vào DimDate")
+    dim_stats['DimDate'] = {
+        'inserted': batch_insert_records(duck_conn, 'DimDate', new_date_records),
+        'updated': 0,
+        'unchanged': len(date_df) - len(new_date_records)
+    }
 
     # 5.5. Insert dữ liệu vào FactJobPostingDaily và FactJobLocationBridge
     logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
@@ -564,22 +607,46 @@ if __name__ == "__main__":
     logger.info(f"Đã insert {len(fact_records)} bản ghi vào FactJobPostingDaily")
     logger.info(f"Chuẩn bị insert {len(bridge_records)} bản ghi vào FactJobLocationBridge")
 
-    # Insert bridge records vào FactJobLocationBridge
-    for bridge in bridge_records:
-        try:
-            columns = ", ".join(bridge.keys())
-            placeholders = ", ".join(["?"] * len(bridge))
-            values = list(bridge.values())
-            query = f"""
-                INSERT INTO FactJobLocationBridge ({columns})
-                VALUES ({placeholders})
-            """
-            duck_conn.execute(query, values)
-        except Exception as e:
-            logger.error(f"Lỗi khi insert vào FactJobLocationBridge: {e}")
-            logger.error(f"Record: {bridge}")
-    logger.info(f"Đã insert {len(bridge_records)} bản ghi vào FactJobLocationBridge")
+    # Batch insert bridge records vào FactJobLocationBridge
+    bridge_inserted = batch_insert_records(duck_conn, 'FactJobLocationBridge', bridge_records)
+    logger.info(f"Đã batch insert {bridge_inserted} bản ghi vào FactJobLocationBridge")
 
-    # 6. Đóng kết nối
+    # 6. Tổng kết ETL
+    logger.info("="*60)
+    logger.info("📊 TỔNG KẾT ETL STAGING TO DWH")
+    logger.info("="*60)
+    
+    total_inserted = sum(stats.get('inserted', 0) for stats in dim_stats.values())
+    total_updated = sum(stats.get('updated', 0) for stats in dim_stats.values())
+    total_unchanged = sum(stats.get('unchanged', 0) for stats in dim_stats.values())
+    
+    for table, stats in dim_stats.items():
+        logger.info(f"{table:15} - Insert: {stats['inserted']:5}, Update: {stats['updated']:5}, Unchanged: {stats['unchanged']:5}")
+    
+    logger.info(f"{'FACTS':15} - FactJobPostingDaily: {len(fact_records)} records")
+    logger.info(f"{'BRIDGE':15} - FactJobLocationBridge: {bridge_inserted} records")
+    logger.info("-"*60)
+    logger.info(f"TỔNG DIM        - Insert: {total_inserted:5}, Update: {total_updated:5}, Unchanged: {total_unchanged:5}")
+    logger.info(f"TỔNG FACT/BRIDGE- Records: {len(fact_records) + bridge_inserted}")
+    
+    # Log load_month stats
+    if fact_records:
+        load_months = set(record.get('load_month') for record in fact_records)
+        logger.info(f"Partition load_month: {', '.join(sorted(load_months))}")
+    
+    logger.info("="*60)
+    
+    # 7. Validation và Data Quality Check
+    logger.info("🔍 Bắt đầu validation ETL...")
+    try:
+        from src.utils.etl_validator import generate_etl_report, log_validation_results
+        validation_results = generate_etl_report(duck_conn)
+        log_validation_results(validation_results)
+    except ImportError:
+        logger.warning("Không thể import etl_validator - bỏ qua validation")
+    except Exception as e:
+        logger.error(f"Lỗi khi thực hiện validation: {e}")
+    
+    # 8. Đóng kết nối
     duck_conn.close()
-    logger.info("✅ ETL hoàn thành!")
+    logger.info("✅ ETL HOÀN THÀNH THÀNH CÔNG!")
