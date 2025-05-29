@@ -56,18 +56,18 @@ CREATE TABLE IF NOT EXISTS FactJobPostingDaily (
     verified_employer BOOLEAN,
     posted_time TIMESTAMP,
     crawled_at TIMESTAMP,
-    load_month VARCHAR(7) NOT NULL,
-    FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
-    FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
-    FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
+    load_month VARCHAR(7) NOT NULL
+    -- FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
+    -- FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
+    -- FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
 );
 
 CREATE TABLE IF NOT EXISTS FactJobLocationBridge (
     fact_id INTEGER NOT NULL,
     location_sk INTEGER NOT NULL,
-    PRIMARY KEY (fact_id, location_sk),
-    FOREIGN KEY (fact_id) REFERENCES FactJobPostingDaily(fact_id),
-    FOREIGN KEY (location_sk) REFERENCES DimLocation(location_sk)
+    PRIMARY KEY (fact_id, location_sk)
+    -- FOREIGN KEY (fact_id) REFERENCES FactJobPostingDaily(fact_id),
+    -- FOREIGN KEY (location_sk) REFERENCES DimLocation(location_sk)
 );
 
 -- PHẦN 2: TẠO INDEXES

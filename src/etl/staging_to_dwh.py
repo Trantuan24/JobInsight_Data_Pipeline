@@ -535,15 +535,20 @@ if __name__ == "__main__":
         logger.info("Không có bản ghi nào để xử lý từ staging")
         sys.exit(0)  # Thoát sớm nếu không có dữ liệu
 
-    # 2. Có thể xóa file DuckDB cũ nếu cần (tùy chọn)
+    # 2. Không xóa file DuckDB để giữ lại dữ liệu cho SCD Type 2
+    # if os.path.exists(DUCKDB_PATH):
+    #     os.remove(DUCKDB_PATH)
+    #     logger.info(f"Đã xóa file DuckDB cũ: {DUCKDB_PATH}")
+    
     if os.path.exists(DUCKDB_PATH):
-        os.remove(DUCKDB_PATH)
-        logger.info(f"Đã xóa file DuckDB cũ: {DUCKDB_PATH}")
+        logger.info(f"📁 Sử dụng DuckDB hiện có: {DUCKDB_PATH}")
+    else:
+        logger.info(f"🆕 Tạo DuckDB mới: {DUCKDB_PATH}")
 
-    # 3. Thiết lập schema và bảng (sau khi xóa file nếu cần)
+    # 3. Thiết lập schema và bảng (giữ nguyên dữ liệu cũ)
     setup_duckdb_schema()
 
-    # 4. Kết nối DuckDB và thực hiện insert
+    # 4. Kết nối DuckDB và thực hiện ETL với SCD Type 2
     duck_conn = get_duckdb_connection(DUCKDB_PATH)
     
     # 5. Xử lý và insert dữ liệu với SCD Type 2

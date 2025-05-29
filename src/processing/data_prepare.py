@@ -187,38 +187,46 @@ def apply_scd_type2_updates(duck_conn, dim_table: str, surrogate_key: str, updat
     for update_info in updates:
         old_record = update_info['old_record']
         new_record = update_info['new_record']
-        
         try:
-            # 1. Đóng bản ghi cũ (set expiry_date và is_current = FALSE)
+            logger.info(f"Updating old record: {old_record.to_dict() if hasattr(old_record, 'to_dict') else old_record}")
+            logger.info(f"Surrogate key value: {old_record[surrogate_key]}")
+            # 1. Đóng bản ghi cũ
             update_query = f"""
                 UPDATE {dim_table}
                 SET expiry_date = ?, is_current = FALSE
                 WHERE {surrogate_key} = ?
             """
-            duck_conn.execute(update_query, [today, old_record[surrogate_key]])
+            # Sửa thành:
+            surrogate_key_value = old_record[surrogate_key]
+            if hasattr(surrogate_key_value, 'item'):
+                surrogate_key_value = surrogate_key_value.item()  # Chuyển numpy.int32 -> int
+            duck_conn.execute(update_query, [today, surrogate_key_value])
             
             # 2. Insert bản ghi mới
-            new_record_dict = new_record.to_dict() if hasattr(new_record, 'to_dict') else new_record
-            
-            # Loại bỏ surrogate key để tự tạo
-            if surrogate_key in new_record_dict:
-                del new_record_dict[surrogate_key]
-            
+            new_record_dict = new_record.to_dict() if hasattr(new_record, 'to_dict') else dict(new_record)
+
+            # Loại bỏ mọi trường liên quan đến surrogate key (phòng trường hợp tên cột viết hoa/thường khác nhau)
+            for key in list(new_record_dict.keys()):
+                if key.lower() == surrogate_key.lower():
+                    del new_record_dict[key]
+
             # Đặt effective_date và is_current
             new_record_dict['effective_date'] = today
             new_record_dict['is_current'] = True
             new_record_dict['expiry_date'] = None
-            
+
             # Insert
             columns = list(new_record_dict.keys())
             placeholders = ', '.join(['?'] * len(columns))
             values = [new_record_dict[col] for col in columns]
-            
+
             # Handle JSON values
             for i, val in enumerate(values):
                 if isinstance(val, (dict, list)):
                     values[i] = json.dumps(val)
-            
+
+            logger.info(f"Inserting new SCD2 record into {dim_table}: {new_record_dict}")
+
             insert_query = f"""
                 INSERT INTO {dim_table} ({', '.join(columns)})
                 VALUES ({placeholders})
