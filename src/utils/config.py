@@ -18,7 +18,7 @@ LOGS_DIR = BASE_DIR / "logs"
 for dir_path in [DATA_DIR, LOGS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
-# Database configurations
+# # Database configurations
 # DB_CONFIG = {
 #     "host": os.getenv("DB_HOST", "postgres"),
 #     "port": int(os.getenv("DB_PORT", 5432)),
