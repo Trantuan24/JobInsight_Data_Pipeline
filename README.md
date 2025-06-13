@@ -13,7 +13,7 @@ JobInsight Data Pipeline is a robust framework designed to streamline the proces
 ## Installation Instructions
 1. **Clone the repository**:
    ```bash
-   git clone <repository-url>
+   git clone [<repository-url>](https://github.com/Trantuan24/JobInsight_Data_Pipeline.git)
    ```
 2. **Navigate to the project directory**:
    ```bash
