@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS jobinsight_staging.staging_jobs (
     salary_max NUMERIC,
     salary_type VARCHAR(20),
     skills JSONB,
-    location VARCHAR(100),
+    location VARCHAR(200),
     location_detail TEXT,
     location_pairs JSONB,
     deadline VARCHAR(50),

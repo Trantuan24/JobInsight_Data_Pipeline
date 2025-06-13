@@ -2,16 +2,17 @@ version: '3'
 
 x-airflow-common:
   &airflow-common
-  # Sử dụng image mặc định thay vì build (để đảm bảo các phụ thuộc)
-  image: apache/airflow:2.7.1
-  # build: .
+  # Build từ Dockerfile để cài đặt Playwright và dependencies
+  # image: apache/airflow:2.7.1
+  build: .
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: '46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho='
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '10'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
@@ -20,20 +21,29 @@ x-airflow-common:
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
     AIRFLOW__WEBSERVER__SESSION_BACKEND: 'database'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'jobinsight_secret_key_01234567890'
+    # Cấu hình logging để tránh lỗi 403 với log server
+    AIRFLOW__LOGGING__REMOTE_LOGGING: 'false'
+    AIRFLOW__LOGGING__LOGGING_LEVEL: 'INFO'
+    AIRFLOW__LOGGING__TASK_LOG_READER: 'task'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__HOSTNAME_CALLABLE: 'socket:getfqdn'
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: '/opt/airflow/logs'
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
-    _PIP_ADDITIONAL_REQUIREMENTS: 'Flask-Session==0.4.0 connexion[swagger-ui]==2.14.2'
+    _PIP_ADDITIONAL_REQUIREMENTS: 'Flask-Session==0.4.0 connexion[swagger-ui]==2.14.2 duckdb==0.9.1 playwright==1.39.0 pyarrow==13.0.0'
     # The following line can be used to set a custom config file, stored in the local config folder
     # If you want to use it, outcomment it and replace airflow.cfg with the name of your config file
     # AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./logs:/opt/airflow/logs
+    - ./logs:/opt/airflow/logs:rw,z
     - ./plugins:/opt/airflow/plugins
     - ./src:/opt/airflow/src
     - ./sql:/opt/airflow/sql
     - ./data:/opt/airflow/data
-  user: "${AIRFLOW_UID:-50000}:0"
+# Sử dụng user airflow mặc định thay vì chỉ định UID
+  # user: "1000:0"
   depends_on:
     &airflow-common-depends-on
     postgres:
@@ -46,15 +56,21 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+      # Thêm biến môi trường cho việc tạo database và user jobinsight
+      POSTGRES_JOBINSIGHT_DB: jobinsight
+      POSTGRES_JOBINSIGHT_USER: jobinsight
+      POSTGRES_JOBINSIGHT_PASSWORD: jobinsight
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
-      - ./sql/schema_raw_jobs.sql:/docker-entrypoint-initdb.d/schema_raw_jobs.sql
-      - ./sql/processed_jobs.sql:/docker-entrypoint-initdb.d/processed_jobs.sql
-      - ./sql/stored_procedures.sql:/docker-entrypoint-initdb.d/stored_procedures.sql
-      - ./sql/views.sql:/docker-entrypoint-initdb.d/views.sql
+      - ./sql/create_user.sql:/docker-entrypoint-initdb.d/00-create_user.sql  # Chạy đầu tiên để tạo user và database
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql  # Chạy tiếp theo để setup schema
+      - ./sql/schema_raw_jobs.sql:/docker-entrypoint-initdb.d/02-schema_raw_jobs.sql
+      - ./sql/schema_staging.sql:/docker-entrypoint-initdb.d/03-schema_staging.sql
+      - ./sql/stored_procedures.sql:/docker-entrypoint-initdb.d/04-stored_procedures.sql
+      - ./sql/schema_dwh.sql:/docker-entrypoint-initdb.d/05-schema_dwh.sql
+      - ./sql/views.sql:/docker-entrypoint-initdb.d/06-views.sql
     ports:
-      - "5434:5432"
+      - "5434:5432"  
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -64,7 +80,7 @@ services:
 
   airflow-webserver:
     <<: *airflow-common
-    command: webserver
+    command: airflow webserver
     ports:
       - 8080:8080
     healthcheck:
@@ -81,7 +97,11 @@ services:
 
   airflow-scheduler:
     <<: *airflow-common
-    command: scheduler
+    command: airflow scheduler
+    environment:
+      <<: *airflow-common-env
+      PYTHONPATH: "/opt/airflow"
+      AIRFLOW__SCHEDULER__PRINT_STATS_INTERVAL: "30"
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -101,7 +121,8 @@ services:
           --firstname Admin \
           --lastname User \
           --role Admin \
-          --email admin@example.com
+          --email admin@example.com && \
+        playwright install --with-deps chromium
     restart: on-failure
 
   grafana:
@@ -121,3 +142,7 @@ services:
 volumes:
   postgres-db-volume:
   grafana_data:
+
+networks:
+  default:
+    name: jobinsight_network

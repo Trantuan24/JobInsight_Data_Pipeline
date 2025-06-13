@@ -1,242 +1,136 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-Airflow DAG cho việc crawl dữ liệu công việc từ TopCV
-Pipeline: Crawl Jobs → Ingest to Database
-
-Author: JobInsight Team
-Date: 2025-05-29
-"""
-
-import os
-import sys
 from datetime import datetime, timedelta
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from airflow.utils.dates import days_ago
+from airflow.operators.dummy import DummyOperator
+import logging
 
-# Thêm đường dẫn project root
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'src'))
+print("LOADING CRAWL_JOBS DAG!")
+logging.info("LOADING CRAWL_JOBS DAG!")
+import sys
+import os
+
+# Thêm đường dẫn để import các modules từ src
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)) + "/..")
 
 # Import các modules cần thiết
-try:
-    from src.utils.config import (
-        AIRFLOW_DAG_ID, AIRFLOW_SCHEDULE, AIRFLOW_CATCHUP, 
-        AIRFLOW_RETRIES, AIRFLOW_RETRY_DELAY
-    )
-    from src.utils.logger import get_logger
-    logger = get_logger("airflow.crawl_jobs")
-except ImportError as e:
-    print(f"Warning: Could not import config: {e}")
-    # Fallback values
-    AIRFLOW_DAG_ID = "jobinsight_crawl_jobs"
-    AIRFLOW_SCHEDULE = "0 9 * * *"
-    AIRFLOW_CATCHUP = False
-    AIRFLOW_RETRIES = 3
-    AIRFLOW_RETRY_DELAY = 5
-    # Fallback logger
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("airflow.crawl_jobs")
+from src.crawler.crawler import crawl_jobs
+from src.ingestion.ingest import ingest_dataframe
 
-# Default arguments cho DAG
 default_args = {
-    'owner': 'jobinsight_team',
+    'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': days_ago(1),
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': AIRFLOW_RETRIES,
-    'retry_delay': timedelta(minutes=AIRFLOW_RETRY_DELAY),
-    'catchup': AIRFLOW_CATCHUP,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
 }
 
-# Tạo DAG instance
-dag = DAG(
-    'crawl_jobs_pipeline',
+with DAG(
+    'crawl_topcv_jobs',
     default_args=default_args,
-    description='Pipeline crawl dữ liệu công việc từ TopCV và ingest vào database',
-    schedule_interval=AIRFLOW_SCHEDULE,
-    start_date=days_ago(1),
-    catchup=AIRFLOW_CATCHUP,
-    tags=['jobinsight', 'crawler', 'topcv'],
-    max_active_runs=1,  # Chỉ cho phép 1 run tại một thời điểm
-)
+    description='Crawl job data from TopCV and ingest to database',
+    schedule_interval='0 11 * * *',  # Chạy 9 giờ sáng mỗi ngày
+    start_date=datetime(2023, 10, 1),
+    catchup=False,
+    tags=['jobinsight', 'crawler'],
+) as dag:
 
-def run_crawler(**context):
-    """
-    Task chạy crawler để crawl dữ liệu từ TopCV
-    """
-    try:
-        logger.info("Bắt đầu crawl dữ liệu từ TopCV...")
-        
-        # Import crawler modules
-        from crawler.crawler import crawl_multiple_keywords
-        
-        # Chạy crawler với 1 trang cho mỗi keyword
-        df_result = crawl_multiple_keywords(num_pages=1)
-        
-        if df_result is not None and not df_result.empty:
-            job_count = len(df_result)
-            logger.info(f"Crawler hoàn thành: {job_count} jobs")
-            return {
-                'status': 'SUCCESS',
-                'job_count': job_count,
-                'dataframe_size': df_result.shape
-            }
-        else:
-            logger.warning("Crawler không thu thập được dữ liệu")
-            return {
-                'status': 'WARNING',
-                'job_count': 0,
-                'message': 'No data collected'
-            }
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi chạy crawler: {str(e)}")
-        raise
+    start = DummyOperator(
+        task_id='start',
+    )
 
-def run_ingestion(**context):
-    """
-    Task ingest dữ liệu crawled vào database
-    """
-    try:
-        logger.info("Bắt đầu ingest dữ liệu vào database...")
-        
-        # Import modules
-        sys.path.insert(0, os.path.join(PROJECT_ROOT, 'src'))
-        from crawler.crawler import crawl_multiple_keywords
-        from ingestion.ingest import ingest_dataframe, setup_database_schema
-        
-        # Thiết lập database schema trước
-        setup_result = setup_database_schema()
-        if not setup_result:
-            raise ValueError("Không thể thiết lập database schema!")
-        
-        # Lấy dữ liệu từ crawler (có thể sử dụng cache hoặc crawl lại)
-        df = crawl_multiple_keywords(num_pages=1)
-        
-        if df is not None and not df.empty:
-            # Ingest vào database
-            imported_count = ingest_dataframe(df)
+    # Đường dẫn tạm thời để lưu DataFrame
+    temp_file_path = "/opt/airflow/data/temp_crawled_data.csv"
+    
+    # Task crawl dữ liệu từ TopCV và lưu vào file
+    def crawl_and_save(**kwargs):
+        # Crawl 5 trang từ BASE_URL, không sử dụng keywords nữa
+        df = crawl_jobs(num_pages=5)
+        if not df.empty:
+            # Tạo thư mục nếu chưa tồn tại
+            import os
+            os.makedirs(os.path.dirname(temp_file_path), exist_ok=True)
             
-            logger.info(f"Ingestion hoàn thành: {imported_count} records")
-            return {
-                'status': 'SUCCESS',
-                'imported_count': imported_count
-            }
-        else:
-            raise ValueError("Không có dữ liệu để ingest!")
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi ingest dữ liệu: {str(e)}")
-        raise
-
-def validate_crawled_data(**context):
-    """
-    Task validate dữ liệu đã crawl
-    """
-    try:
-        logger.info("Kiểm tra tính hợp lệ của dữ liệu đã crawl...")
-        
-        # Kiểm tra file tracking jobs có tồn tại không
-        tracking_dir = os.path.join(PROJECT_ROOT, 'data', 'job_tracking')
-        if not os.path.exists(tracking_dir):
-            raise ValueError("Thư mục job_tracking không tồn tại!")
-        
-        # Kiểm tra có file tracking mới nhất không
-        import glob
-        tracking_files = glob.glob(os.path.join(tracking_dir, 'jobs_tracking_*.json'))
-        if not tracking_files:
-            raise ValueError("Không tìm thấy file tracking jobs!")
-        
-        latest_file = max(tracking_files, key=os.path.getctime)
-        file_size = os.path.getsize(latest_file)
-        
-        logger.info(f"File tracking mới nhất: {latest_file}, Size: {file_size} bytes")
-        
-        # Kiểm tra file không rỗng
-        if file_size < 100:  # Tối thiểu 100 bytes
-            raise ValueError(f"File tracking quá nhỏ: {file_size} bytes")
-        
-        return {
-            'latest_file': latest_file,
-            'file_size': file_size,
-            'validation_status': 'PASSED'
-        }
-        
-    except Exception as e:
-        logger.error(f"Validation thất bại: {str(e)}")
-        raise
-
-# Định nghĩa các tasks
-task_validate_env = BashOperator(
-    task_id='validate_environment',
-    bash_command='''
-    echo "Kiểm tra môi trường..."
-    cd {{ params.project_root }}
+            # Chuyển đổi các trường JSON về dạng string an toàn
+            import json
+            if 'skills' in df.columns:
+                # Chuyển đổi skills từ cấu trúc dữ liệu thành JSON string đúng định dạng
+                df['skills'] = df['skills'].apply(lambda x: json.dumps(x) if x is not None else None)
+            
+            # Lưu DataFrame vào file CSV
+            df.to_csv(temp_file_path, index=False)
+            return temp_file_path
+        return None
     
-    # Kiểm tra thư mục cần thiết
-    if [ ! -d "src/crawler" ]; then
-        echo "ERROR: Thư mục src/crawler không tồn tại!"
-        exit 1
-    fi
+    crawl_task = PythonOperator(
+        task_id='crawl_topcv_data',
+        python_callable=crawl_and_save,
+    )
     
-    if [ ! -d "data" ]; then
-        echo "Tạo thư mục data..."
-        mkdir -p data/job_tracking/backups
-    fi
-    
-    if [ ! -d "logs" ]; then
-        echo "Tạo thư mục logs..."
-        mkdir -p logs
-    fi
-    
-    echo "Môi trường OK!"
-    ''',
-    params={'project_root': PROJECT_ROOT},
-    dag=dag,
-)
+    # Task đọc file CSV và ingest vào database
+    def load_and_ingest(**kwargs):
+        import pandas as pd
+        import os
+        import json
+        
+        if os.path.exists(temp_file_path):
+            df = pd.read_csv(temp_file_path)
+            
+            # Chuyển đổi job_id thành chuỗi
+            if 'job_id' in df.columns:
+                df['job_id'] = df['job_id'].astype(str)
+                print(f"Đã chuyển đổi job_id sang kiểu chuỗi: {df['job_id'].head()}")
+            
+            # Chuyển đổi trường skills từ string JSON thành cấu trúc dữ liệu Python
+            if 'skills' in df.columns:
+                def parse_json_safely(value):
+                    if pd.isna(value) or value is None or value == '':
+                        return None
+                    try:
+                        return json.loads(value)
+                    except:
+                        return None
+                
+                df['skills'] = df['skills'].apply(parse_json_safely)
+                print(f"Đã chuyển đổi skills sang JSON: {str(df['skills'].head())}")
+            
+            # Đảm bảo posted_time không bị null
+            if 'posted_time' in df.columns:
+                # Đếm số giá trị null
+                null_count = df['posted_time'].isnull().sum()
+                if null_count > 0:
+                    print(f"Cảnh báo: {null_count} bản ghi có posted_time là NULL")
+                    # Kiểm tra xem có cột last_update không để tính posted_time
+                    if 'last_update' in df.columns:
+                        from datetime import datetime
+                        from src.crawler.data_extractor import parse_last_update
+                        
+                        # Chỉ điền posted_time cho các bản ghi NULL
+                        for idx, row in df[df['posted_time'].isnull()].iterrows():
+                            if pd.notna(row['last_update']):
+                                try:
+                                    seconds_ago = parse_last_update(row['last_update'])
+                                    posted_time = datetime.now().timestamp() - seconds_ago
+                                    df.at[idx, 'posted_time'] = datetime.fromtimestamp(posted_time).isoformat()
+                                except:
+                                    print(f"Không thể tính posted_time cho job_id: {row['job_id']}")
+                
+                # In thông tin về posted_time
+                print(f"Kiểm tra posted_time sau xử lý: {df['posted_time'].head()}")
+            
+            ingest_dataframe(df)
+            # Xóa file tạm sau khi ingest
+            os.remove(temp_file_path)
+            return f"Ingested {len(df)} records"
+        return "No data to ingest"
+        
+    ingest_task = PythonOperator(
+        task_id='ingest_job_data',
+        python_callable=load_and_ingest,
+    )
 
-task_run_crawler = PythonOperator(
-    task_id='run_topcv_crawler',
-    python_callable=run_crawler,
-    dag=dag,
-)
+    end = DummyOperator(
+        task_id='end',
+    )
 
-task_validate_data = PythonOperator(
-    task_id='validate_crawled_data',
-    python_callable=validate_crawled_data,
-    dag=dag,
-)
-
-task_run_ingestion = PythonOperator(
-    task_id='run_data_ingestion',
-    python_callable=run_ingestion,
-    dag=dag,
-)
-
-task_cleanup = BashOperator(
-    task_id='cleanup_old_files',
-    bash_command='''
-    echo "Dọn dẹp files cũ..."
-    cd {{ params.project_root }}/data/job_tracking/backups
-    
-    # Giữ lại 7 file backup gần nhất
-    ls -t jobs_tracking_backup_*.json | tail -n +8 | xargs -r rm -f
-    
-    echo "Cleanup hoàn thành!"
-    ''',
-    params={'project_root': PROJECT_ROOT},
-    dag=dag,
-)
-
-# Thiết lập dependencies
-task_validate_env >> task_run_crawler >> task_validate_data >> task_run_ingestion >> task_cleanup
-
-# Export DAG
-globals()['crawl_jobs_pipeline'] = dag
+    start >> crawl_task >> ingest_task >> end 

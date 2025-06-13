@@ -262,6 +262,31 @@ def process_staging_data(df):
     logger.info(f"Đã hoàn thành xử lý chi tiết cho {len(processed_df)} bản ghi")
     return processed_df
 
+def verify_etl_integrity(source_count, target_count, threshold=0.98):
+    """
+    Kiểm tra tính toàn vẹn dữ liệu sau ETL.
+    
+    Args:
+        source_count (int): Số bản ghi nguồn
+        target_count (int): Số bản ghi đích
+        threshold (float): Ngưỡng chấp nhận (% dữ liệu được xử lý thành công)
+        
+    Returns:
+        bool: True nếu tỷ lệ dữ liệu chuyển đổi đạt threshold
+    """
+    if source_count == 0:
+        logger.warning("Không có dữ liệu nguồn để xử lý")
+        return True
+        
+    success_rate = target_count / source_count
+    logger.info(f"Tỷ lệ dữ liệu xử lý thành công: {success_rate:.2%} ({target_count}/{source_count})")
+    
+    if success_rate < threshold:
+        logger.error(f"Tỷ lệ dữ liệu xử lý ({success_rate:.2%}) thấp hơn ngưỡng {threshold:.2%}")
+        return False
+        
+    return True
+
 def run_etl():
     """
     Thực hiện quy trình ETL hoàn chỉnh
@@ -271,6 +296,7 @@ def run_etl():
     """
     try:
         logger.info("Bắt đầu quy trình ETL...")
+        start_time = datetime.now()
         
         # 1. Thiết lập schema và bảng nếu cần
         if not setup_database_schema():
@@ -284,16 +310,36 @@ def run_etl():
         
         # 3. Load dữ liệu từ staging để xử lý thêm bằng pandas
         staging_df = load_staging_data()
+        source_count = len(staging_df)
         
         # 4. Xử lý chi tiết bằng pandas
         processed_df = process_staging_data(staging_df)
+        processed_count = len(processed_df)
+        
+        # Kiểm tra tính toàn vẹn dữ liệu sau bước xử lý
+        if not verify_etl_integrity(source_count, processed_count):
+            logger.warning("Phát hiện mất mát dữ liệu trong quá trình xử lý!")
+            # Vẫn tiếp tục nhưng đã cảnh báo
         
         # 5. Lưu kết quả trở lại bảng staging
         if not save_back_to_staging(processed_df):
             logger.error("Không thể lưu kết quả vào bảng staging!")
             return False
         
-        logger.info("Quy trình ETL đã hoàn thành thành công!")
+        # Tính thời gian chạy
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        # Thống kê ETL
+        etl_stats = {
+            "source_count": source_count,
+            "processed_count": processed_count,
+            "success_rate": processed_count / max(1, source_count) * 100,
+            "duration_seconds": duration
+        }
+        
+        logger.info(f"Quy trình ETL đã hoàn thành thành công trong {duration:.2f} giây!")
+        logger.info(f"Thống kê ETL: {json.dumps(etl_stats)}")
+        
         return True
     except Exception as e:
         logger.error(f"Lỗi trong quy trình ETL: {e}")

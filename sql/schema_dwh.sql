@@ -56,10 +56,11 @@ CREATE TABLE IF NOT EXISTS FactJobPostingDaily (
     verified_employer BOOLEAN,
     posted_time TIMESTAMP,
     crawled_at TIMESTAMP,
-    load_month VARCHAR(7) NOT NULL
+    load_month VARCHAR(7) NOT NULL,
     -- FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
     -- FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
     -- FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
+    UNIQUE (job_sk, date_id)  -- Ngăn chặn duplicate fact records
 );
 
 CREATE TABLE IF NOT EXISTS FactJobLocationBridge (

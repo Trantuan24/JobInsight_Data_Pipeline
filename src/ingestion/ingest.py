@@ -8,6 +8,7 @@ from datetime import datetime
 import pandas as pd
 from psycopg2 import extras
 import numpy as np
+from typing import Dict, Any, Tuple, List, Optional
 
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,17 +34,59 @@ logger = logging.getLogger(__name__)
 try:
     from src.utils.config import DB_CONFIG, RAW_JOBS_TABLE, RAW_BATCH_SIZE
     from src.utils.db import get_connection, execute_query, table_exists
+    from src.utils.logger import get_logger
 except ImportError as e:
     # Thử cách thay thế
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
     from utils.config import DB_CONFIG, RAW_JOBS_TABLE, RAW_BATCH_SIZE
     from utils.db import get_connection, execute_query, table_exists
+    from utils.logger import get_logger
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
 if not os.path.exists(SQL_DIR):
     SQL_DIR = os.path.join(os.getcwd(), "sql")
     os.makedirs(SQL_DIR, exist_ok=True)
+
+def validate_job_data(job_data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Kiểm tra tính hợp lệ của dữ liệu job trước khi insert vào database.
+    
+    Args:
+        job_data (Dict[str, Any]): Dữ liệu job cần kiểm tra
+        
+    Returns:
+        Tuple[bool, List[str]]: (is_valid, errors) - Trạng thái hợp lệ và danh sách lỗi
+    """
+    errors = []
+    required_fields = ['job_id', 'title']
+    
+    # Kiểm tra các trường bắt buộc
+    for field in required_fields:
+        if field not in job_data or not job_data[field]:
+            errors.append(f"Thiếu trường bắt buộc: {field}")
+    
+    # Kiểm tra định dạng dữ liệu
+    if 'posted_time' in job_data and job_data['posted_time']:
+        try:
+            if isinstance(job_data['posted_time'], str):
+                datetime.fromisoformat(job_data['posted_time'].replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            errors.append("Định dạng posted_time không hợp lệ")
+    
+    # Kiểm tra job_id phải là chuỗi và có độ dài hợp lý
+    if 'job_id' in job_data and job_data['job_id']:
+        if not isinstance(job_data['job_id'], str):
+            errors.append("job_id phải là chuỗi")
+        elif len(job_data['job_id']) > 50:
+            errors.append(f"job_id quá dài: {len(job_data['job_id'])} ký tự (tối đa 50)")
+    
+    # Kiểm tra skills phải là list hoặc JSON
+    if 'skills' in job_data and job_data['skills']:
+        if not isinstance(job_data['skills'], (list, str)):
+            errors.append("skills phải là danh sách hoặc chuỗi JSON")
+    
+    return len(errors) == 0, errors
 
 def execute_sql_file(sql_file_path):
     """Thực thi các lệnh SQL từ file"""
@@ -87,12 +130,23 @@ def setup_database_schema():
         return False
 
 def dataframe_to_records(df):
-    """Chuyển đổi DataFrame thành danh sách các bản ghi để insert vào database"""
+    """
+    Chuyển đổi DataFrame thành danh sách các bản ghi để insert vào database.
+    Thực hiện xử lý và validation dữ liệu.
+    
+    Args:
+        df (pandas.DataFrame): DataFrame chứa dữ liệu job
+        
+    Returns:
+        List[Dict[str, Any]]: Danh sách các bản ghi đã xử lý
+    """
     if df.empty:
         logger.warning("DataFrame trống, không có dữ liệu để xử lý")
         return []
     
     processed_jobs = []
+    invalid_jobs = 0
+    
     try: 
         for _, row in df.iterrows():
             job_dict = row.to_dict()
@@ -103,10 +157,26 @@ def dataframe_to_records(df):
             
             # Xử lý skills thành JSON
             if 'skills' in job_dict:
-                if isinstance(job_dict['skills'], list):
+                # Xử lý trường hợp skills đã là string nhưng cần đảm bảo định dạng JSON
+                if isinstance(job_dict['skills'], str):
+                    try:
+                        # Thử parse để kiểm tra đã là JSON hợp lệ chưa
+                        _ = json.loads(job_dict['skills'])
+                        # Nếu parse thành công, giữ nguyên giá trị
+                    except:
+                        # Nếu không phải JSON hợp lệ, chuyển đổi thành JSON
+                        if job_dict['skills'].startswith('['):
+                            # Nếu đã có dạng list nhưng không parse được, đặt làm list rỗng
+                            job_dict['skills'] = json.dumps([])
+                        else:
+                            # Nếu là string đơn, wrap trong list
+                            job_dict['skills'] = json.dumps([job_dict['skills']])
+                elif isinstance(job_dict['skills'], list):
+                    # Nếu là list, chuyển thành JSON string
                     job_dict['skills'] = json.dumps(job_dict['skills'])
-                elif isinstance(job_dict['skills'], str) and not job_dict['skills'].startswith('['):
-                    job_dict['skills'] = json.dumps([job_dict['skills']])
+                else:
+                    # Trường hợp khác (None, nan, ...)
+                    job_dict['skills'] = json.dumps([])
             else:
                 job_dict['skills'] = json.dumps([])
             
@@ -128,10 +198,18 @@ def dataframe_to_records(df):
                 job_dict['raw_data'] = json.dumps(job_dict)
             elif not isinstance(job_dict['raw_data'], str):
                 job_dict['raw_data'] = json.dumps(job_dict['raw_data'])
-                
-            processed_jobs.append(job_dict)
             
-        logger.info(f"Đã chuyển đổi {len(processed_jobs)} bản ghi từ DataFrame")
+            # Kiểm tra tính hợp lệ của dữ liệu
+            is_valid, errors = validate_job_data(job_dict)
+            
+            if is_valid:
+                processed_jobs.append(job_dict)
+            else:
+                invalid_jobs += 1
+                error_msg = ", ".join(errors)
+                logger.warning(f"Bỏ qua job_id {job_dict.get('job_id', 'unknown')} không hợp lệ: {error_msg}")
+            
+        logger.info(f"Đã chuyển đổi {len(processed_jobs)} bản ghi từ DataFrame (bỏ qua {invalid_jobs} bản ghi không hợp lệ)")
         return processed_jobs
     except Exception as e:
         logger.error(f"Lỗi khi chuyển đổi DataFrame: {str(e)}")

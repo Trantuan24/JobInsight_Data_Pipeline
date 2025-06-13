@@ -12,27 +12,27 @@ load_dotenv()
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
-LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR = Path("/opt/airflow/logs")
 
 # Create directories if they don't exist
 for dir_path in [DATA_DIR, LOGS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
-# # Database configurations
-# DB_CONFIG = {
-#     "host": os.getenv("DB_HOST", "postgres"),
-#     "port": int(os.getenv("DB_PORT", 5432)),
-#     "user": os.getenv("DB_USER", "jobinsight"),
-#     "password": os.getenv("DB_PASSWORD", "jobinsight"),
-#     "database": os.getenv("DB_NAME", "jobinsight"),
-# }
+# Database configurations
 DB_CONFIG = {
-    "database": "job_database",
-    "user": "postgres",
-    "password": "123456",  # Đổi thành mật khẩu của bạn
-    "host": "localhost",
-    "port": "5432"
+    "host": os.getenv("DB_HOST", "postgres"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "user": os.getenv("DB_USER", "jobinsight"),
+    "password": os.getenv("DB_PASSWORD", "jobinsight"),
+    "database": os.getenv("DB_NAME", "jobinsight"),
 }
+# DB_CONFIG = {
+#     "database": "job_database",
+#     "user": "postgres",
+#     "password": "123456",  # Đổi thành mật khẩu của bạn
+#     "host": "localhost",
+#     "port": "5432"
+# }
 
 # Airflow database config
 AIRFLOW_DB_CONFIG = {

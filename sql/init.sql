@@ -1,11 +1,19 @@
--- Tạo database nếu chưa tồn tại
-SELECT 'CREATE DATABASE jobinsight' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'jobinsight')\gexec
+-- Script khởi tạo cho JobInsight database
+-- Lưu ý: Database và user jobinsight đã được tạo trong script create_user.sql
 
--- Kết nối vào database
+-- Kết nối vào database jobinsight
 \c jobinsight;
 
+-- Log bắt đầu khởi tạo
+\echo 'Starting initialization of JobInsight database'
+
 -- Chạy các script tạo bảng và procedure
-\i /docker-entrypoint-initdb.d/schema_raw_jobs.sql
-\i /docker-entrypoint-initdb.d/processed_jobs.sql
-\i /docker-entrypoint-initdb.d/stored_procedures.sql
-\i /docker-entrypoint-initdb.d/views.sql 
+-- Các scripts được mount riêng biệt trong docker-compose và sẽ chạy theo thứ tự:
+-- 02-schema_raw_jobs.sql 
+-- 03-schema_staging.sql
+-- 04-stored_procedures.sql 
+-- 05-schema_dwh.sql
+-- 06-views.sql
+
+-- Log hoàn thành
+\echo 'Initialization of JobInsight database completed' 

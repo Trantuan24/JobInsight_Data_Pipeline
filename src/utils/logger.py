@@ -8,7 +8,7 @@ from pathlib import Path
 import datetime
 
 from src.utils.config import LOGS_DIR, LOG_LEVEL
-LOGS_DIR = Path("logs")
+LOGS_DIR = Path("/opt/airflow/logs")
 
 def setup_logger(name="jobinsight", log_to_file=True):
     """

@@ -707,137 +707,250 @@ def cleanup_duplicate_fact_records(duck_conn: duckdb.DuckDBPyConnection):
         logger.error(f"Lỗi khi dọn dẹp duplicate records: {e}")
         raise
 
-if __name__ == "__main__":
-    # 1. Lấy dữ liệu từ staging
-    last_etl_date = datetime.now() - timedelta(days=7)
-    staging_batch = get_staging_batch(last_etl_date)
-    if not staging_batch.empty:
-        logger.info(f"Đã lấy {len(staging_batch)} bản ghi từ staging")
-    else:
-        logger.info("Không có bản ghi nào để xử lý từ staging")
-        sys.exit(0)  # Thoát sớm nếu không có dữ liệu
-
-    # 2. Không xóa file DuckDB để giữ lại dữ liệu cho SCD Type 2
-    # if os.path.exists(DUCKDB_PATH):
-    #     os.remove(DUCKDB_PATH)
-    #     logger.info(f"Đã xóa file DuckDB cũ: {DUCKDB_PATH}")
+def verify_etl_integrity(staging_count: int, fact_count: int, threshold: float = 0.9) -> bool:
+    """
+    Kiểm tra tính toàn vẹn của quá trình ETL Staging to DWH
     
-    if os.path.exists(DUCKDB_PATH):
-        logger.info(f"📁 Sử dụng DuckDB hiện có: {DUCKDB_PATH}")
-    else:
-        logger.info(f"🆕 Tạo DuckDB mới: {DUCKDB_PATH}")
-
-    # 3. Thiết lập schema và bảng (giữ nguyên dữ liệu cũ)
-    setup_duckdb_schema()
-
-    # 4. Kết nối DuckDB và thực hiện ETL với SCD Type 2
-    duck_conn = get_duckdb_connection(DUCKDB_PATH)
-    
-    # 0. Dọn dẹp duplicate records hiện có (chạy 1 lần)
-    logger.info("🧹 Dọn dẹp duplicate records hiện có...")
-    cleanup_duplicate_fact_records(duck_conn)
-    
-    # 5. Xử lý và insert dữ liệu với SCD Type 2
-    dim_stats = {}
-    
-    # 5.1 DimJob với SCD Type 2
-    dim_stats['DimJob'] = process_dimension_with_scd2(
-        duck_conn, staging_batch, 'DimJob', prepare_dim_job,
-        'job_id', 'job_sk', ['title_clean', 'skills', 'job_url']
-    )
-
-    # 5.2. DimCompany với SCD Type 2
-    dim_stats['DimCompany'] = process_dimension_with_scd2(
-        duck_conn, staging_batch, 'DimCompany', prepare_dim_company,
-        'company_name_standardized', 'company_sk', ['company_url', 'verified_employer']
-    )
-
-    # 5.3. DimLocation - xử lý đặc biệt vì composite key
-    logger.info("Xử lý DimLocation với composite key")
-    dim_location_df = prepare_dim_location(staging_batch)
-    if not dim_location_df.empty:
-        location_records = []
-        for _, location in dim_location_df.iterrows():
-            location_dict = location.to_dict()
-            if 'location_sk' in location_dict:
-                del location_dict['location_sk']
-            location_records.append(location_dict)
+    Args:
+        staging_count: Số bản ghi staging đầu vào
+        fact_count: Số bản ghi fact đã tạo
+        threshold: Ngưỡng chấp nhận (% dữ liệu được xử lý thành công)
         
-        dim_stats['DimLocation'] = {
-            'inserted': batch_insert_records(duck_conn, 'DimLocation', location_records),
-            'updated': 0,
-            'unchanged': 0
-        }
-    else:
-        dim_stats['DimLocation'] = {'inserted': 0, 'updated': 0, 'unchanged': 0}
+    Returns:
+        bool: True nếu tỷ lệ dữ liệu chuyển đổi đạt threshold
+    """
+    if staging_count == 0:
+        logger.warning("Không có dữ liệu nguồn để xử lý")
+        return True
+    
+    # Mỗi staging record có thể tạo ra nhiều fact record (mỗi ngày một record)
+    # Nên kiểm tra xem có fact records được tạo không, không so sánh số lượng
+    if fact_count == 0:
+        logger.error("Không có fact record nào được tạo từ staging data!")
+        return False
+    
+    logger.info(f"Đã tạo {fact_count} fact records từ {staging_count} staging records")
+    return True
 
-    # 5.4. Đảm bảo bảng DimDate có đầy đủ các ngày cần thiết
-    logger.info("Xử lý DimDate")
-    start_date = (datetime.now() - timedelta(days=60)).date()
-    end_date = (datetime.now() + timedelta(days=240)).date()
+def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Thực hiện quy trình ETL chuyển dữ liệu từ Staging sang Data Warehouse
     
-    date_df = generate_date_range(start_date, end_date)
+    Args:
+        last_etl_date: Timestamp của lần ETL gần nhất, mặc định là 7 ngày trước
+        
+    Returns:
+        Dict[str, Any]: Kết quả thống kê ETL
+    """
+    start_time = datetime.now()
     
-    # Filter out existing dates
-    new_date_records = []
-    for _, date_record in date_df.iterrows():
-        date_dict = date_record.to_dict()
-        exists = duck_conn.execute(f"SELECT 1 FROM DimDate WHERE date_id = ?", [date_dict['date_id']]).fetchone()
-        if not exists:
-            new_date_records.append(date_dict)
-    
-    dim_stats['DimDate'] = {
-        'inserted': batch_insert_records(duck_conn, 'DimDate', new_date_records),
-        'updated': 0,
-        'unchanged': len(date_df) - len(new_date_records)
-    }
-
-    # 5.5. Insert dữ liệu vào FactJobPostingDaily và FactJobLocationBridge
-    logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
-    fact_records, bridge_records = generate_fact_records(duck_conn, staging_batch)
-    logger.info(f"Đã insert {len(fact_records)} bản ghi vào FactJobPostingDaily")
-    logger.info(f"Chuẩn bị insert {len(bridge_records)} bản ghi vào FactJobLocationBridge")
-
-    # Batch insert bridge records vào FactJobLocationBridge
-    bridge_inserted = batch_insert_records(duck_conn, 'FactJobLocationBridge', bridge_records)
-    logger.info(f"Đã batch insert {bridge_inserted} bản ghi vào FactJobLocationBridge")
-
-    # 6. Tổng kết ETL
-    logger.info("="*60)
-    logger.info("📊 TỔNG KẾT ETL STAGING TO DWH")
-    logger.info("="*60)
-    
-    total_inserted = sum(stats.get('inserted', 0) for stats in dim_stats.values())
-    total_updated = sum(stats.get('updated', 0) for stats in dim_stats.values())
-    total_unchanged = sum(stats.get('unchanged', 0) for stats in dim_stats.values())
-    
-    for table, stats in dim_stats.items():
-        logger.info(f"{table:15} - Insert: {stats['inserted']:5}, Update: {stats['updated']:5}, Unchanged: {stats['unchanged']:5}")
-    
-    logger.info(f"{'FACTS':15} - FactJobPostingDaily: {len(fact_records)} records")
-    logger.info(f"{'BRIDGE':15} - FactJobLocationBridge: {bridge_inserted} records")
-    logger.info("-"*60)
-    logger.info(f"TỔNG DIM        - Insert: {total_inserted:5}, Update: {total_updated:5}, Unchanged: {total_unchanged:5}")
-    logger.info(f"TỔNG FACT/BRIDGE- Records: {len(fact_records) + bridge_inserted}")
-    
-    # Log load_month stats
-    if fact_records:
-        load_months = set(record.get('load_month') for record in fact_records)
-        logger.info(f"Partition load_month: {', '.join(sorted(load_months))}")
-    
-    logger.info("="*60)
-    
-    # 7. Validation và Data Quality Check
-    logger.info("🔍 Bắt đầu validation ETL...")
     try:
-        from src.utils.etl_validator import generate_etl_report, log_validation_results
-        validation_results = generate_etl_report(duck_conn)
-        log_validation_results(validation_results)
-    except ImportError:
-        logger.warning("Không thể import etl_validator - bỏ qua validation")
-    except Exception as e:
-        logger.error(f"Lỗi khi thực hiện validation: {e}")
+        # Thiết lập ngày ETL gần nhất nếu không có
+        if last_etl_date is None:
+            last_etl_date = datetime.now() - timedelta(days=7)
+        
+        logger.info("="*60)
+        logger.info(f"🚀 BẮT ĐẦU ETL STAGING TO DWH - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"🕒 Lấy dữ liệu từ: {last_etl_date}")
+        logger.info("="*60)
+        
+        # 1. Lấy dữ liệu từ staging
+        staging_batch = get_staging_batch(last_etl_date)
+        if staging_batch.empty:
+            logger.info("Không có bản ghi nào để xử lý từ staging")
+            return {
+                "success": True,
+                "message": "Không có dữ liệu để xử lý",
+                "source_count": 0,
+                "fact_count": 0,
+                "duration_seconds": (datetime.now() - start_time).total_seconds()
+            }
+            
+        logger.info(f"Đã lấy {len(staging_batch)} bản ghi từ staging")
+        
+        # 2. Kiểm tra file DuckDB
+        if os.path.exists(DUCKDB_PATH):
+            logger.info(f"📁 Sử dụng DuckDB hiện có: {DUCKDB_PATH}")
+        else:
+            logger.info(f"🆕 Tạo DuckDB mới: {DUCKDB_PATH}")
+        
+        # 3. Thiết lập schema và bảng (giữ nguyên dữ liệu cũ)
+        if not setup_duckdb_schema():
+            return {
+                "success": False,
+                "message": "Không thể thiết lập schema DuckDB",
+                "source_count": len(staging_batch),
+                "fact_count": 0,
+                "duration_seconds": (datetime.now() - start_time).total_seconds()
+            }
+        
+        # 4. Kết nối DuckDB và thực hiện ETL với SCD Type 2
+        with get_duckdb_connection(DUCKDB_PATH) as duck_conn:
+            # Dọn dẹp duplicate records hiện có (chạy 1 lần)
+            logger.info("🧹 Dọn dẹp duplicate records hiện có...")
+            cleanup_duplicate_fact_records(duck_conn)
+            
+            # 5. Xử lý và insert dữ liệu với SCD Type 2
+            dim_stats = {}
+            
+            # 5.1 DimJob với SCD Type 2
+            dim_stats['DimJob'] = process_dimension_with_scd2(
+                duck_conn, staging_batch, 'DimJob', prepare_dim_job,
+                'job_id', 'job_sk', ['title_clean', 'skills', 'job_url']
+            )
+        
+            # 5.2. DimCompany với SCD Type 2
+            dim_stats['DimCompany'] = process_dimension_with_scd2(
+                duck_conn, staging_batch, 'DimCompany', prepare_dim_company,
+                'company_name_standardized', 'company_sk', ['company_url', 'verified_employer']
+            )
+        
+            # 5.3. DimLocation - xử lý đặc biệt vì composite key
+            logger.info("Xử lý DimLocation với composite key")
+            dim_location_df = prepare_dim_location(staging_batch)
+            if not dim_location_df.empty:
+                location_records = []
+                for _, location in dim_location_df.iterrows():
+                    location_dict = location.to_dict()
+                    if 'location_sk' in location_dict:
+                        del location_dict['location_sk']
+                    location_records.append(location_dict)
+                
+                dim_stats['DimLocation'] = {
+                    'inserted': batch_insert_records(duck_conn, 'DimLocation', location_records),
+                    'updated': 0,
+                    'unchanged': 0
+                }
+            else:
+                dim_stats['DimLocation'] = {'inserted': 0, 'updated': 0, 'unchanged': 0}
+        
+            # 5.4. Đảm bảo bảng DimDate có đầy đủ các ngày cần thiết
+            logger.info("Xử lý DimDate")
+            start_date = (datetime.now() - timedelta(days=60)).date()
+            end_date = (datetime.now() + timedelta(days=240)).date()
+            
+            date_df = generate_date_range(start_date, end_date)
+            
+            # Filter out existing dates
+            new_date_records = []
+            for _, date_record in date_df.iterrows():
+                date_dict = date_record.to_dict()
+                exists = duck_conn.execute(f"SELECT 1 FROM DimDate WHERE date_id = ?", [date_dict['date_id']]).fetchone()
+                if not exists:
+                    new_date_records.append(date_dict)
+            
+            dim_stats['DimDate'] = {
+                'inserted': batch_insert_records(duck_conn, 'DimDate', new_date_records),
+                'updated': 0,
+                'unchanged': len(date_df) - len(new_date_records)
+            }
+        
+            # 5.5. Insert dữ liệu vào FactJobPostingDaily và FactJobLocationBridge
+            logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
+            fact_records, bridge_records = generate_fact_records(duck_conn, staging_batch)
+            
+            # Kiểm tra tính toàn vẹn của dữ liệu
+            if not verify_etl_integrity(len(staging_batch), len(fact_records)):
+                logger.warning("⚠️ Phát hiện vấn đề về tính toàn vẹn dữ liệu trong quá trình ETL!")
+                # Vẫn tiếp tục nhưng đã cảnh báo
+            
+            logger.info(f"Đã insert {len(fact_records)} bản ghi vào FactJobPostingDaily")
+            logger.info(f"Chuẩn bị insert {len(bridge_records)} bản ghi vào FactJobLocationBridge")
+        
+            # Batch insert bridge records vào FactJobLocationBridge
+            bridge_inserted = batch_insert_records(duck_conn, 'FactJobLocationBridge', bridge_records)
+            logger.info(f"Đã batch insert {bridge_inserted} bản ghi vào FactJobLocationBridge")
+        
+            # 6. Tổng kết ETL
+            logger.info("="*60)
+            logger.info("📊 TỔNG KẾT ETL STAGING TO DWH")
+            logger.info("="*60)
+            
+            total_inserted = sum(stats.get('inserted', 0) for stats in dim_stats.values())
+            total_updated = sum(stats.get('updated', 0) for stats in dim_stats.values())
+            total_unchanged = sum(stats.get('unchanged', 0) for stats in dim_stats.values())
+            
+            for table, stats in dim_stats.items():
+                logger.info(f"{table:15} - Insert: {stats['inserted']:5}, Update: {stats['updated']:5}, Unchanged: {stats['unchanged']:5}")
+            
+            logger.info(f"{'FACTS':15} - FactJobPostingDaily: {len(fact_records)} records")
+            logger.info(f"{'BRIDGE':15} - FactJobLocationBridge: {bridge_inserted} records")
+            logger.info("-"*60)
+            logger.info(f"TỔNG DIM        - Insert: {total_inserted:5}, Update: {total_updated:5}, Unchanged: {total_unchanged:5}")
+            logger.info(f"TỔNG FACT/BRIDGE- Records: {len(fact_records) + bridge_inserted}")
+            
+            # Log load_month stats
+            load_months = set()
+            if fact_records:
+                load_months = set(record.get('load_month') for record in fact_records)
+                logger.info(f"Partition load_month: {', '.join(sorted(load_months))}")
+            
+            # 7. Validation và Data Quality Check
+            logger.info("🔍 Bắt đầu validation ETL...")
+            validation_success = True
+            validation_message = ""
+            
+            try:
+                from src.utils.etl_validator import generate_etl_report, log_validation_results
+                validation_results = generate_etl_report(duck_conn)
+                log_validation_results(validation_results)
+                
+                # Kiểm tra các vấn đề nghiêm trọng
+                if validation_results.get('issues', {}).get('critical', 0) > 0:
+                    validation_success = False
+                    validation_message = f"Phát hiện {validation_results['issues']['critical']} vấn đề nghiêm trọng trong validation"
+                    logger.error(validation_message)
+            except ImportError:
+                logger.warning("Không thể import etl_validator - bỏ qua validation")
+            except Exception as e:
+                validation_success = False
+                validation_message = f"Lỗi khi thực hiện validation: {str(e)}"
+                logger.error(validation_message)
+        
+        # Tính thời gian chạy
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        # Tổng kết
+        logger.info("="*60)
+        logger.info(f"✅ ETL HOÀN THÀNH TRONG {duration:.2f} GIÂY!")
+        logger.info("="*60)
+        
+        # Thống kê kết quả ETL
+        etl_stats = {
+            "success": True,
+            "source_count": len(staging_batch),
+            "fact_count": len(fact_records),
+            "bridge_count": bridge_inserted,
+            "dim_stats": dim_stats,
+            "total_dim_inserted": total_inserted,
+            "total_dim_updated": total_updated,
+            "load_months": list(load_months),
+            "duration_seconds": duration,
+            "validation_success": validation_success,
+            "validation_message": validation_message
+        }
+        
+        return etl_stats
     
-    # 8. Đóng kết nối
-    duck_conn.close()
-    logger.info("✅ ETL HOÀN THÀNH THÀNH CÔNG!")
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        error_msg = f"Lỗi trong quá trình ETL: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        
+        return {
+            "success": False,
+            "message": error_msg,
+            "duration_seconds": duration
+        }
+
+if __name__ == "__main__":
+    # Chạy ETL với dữ liệu từ 7 ngày trước
+    etl_result = run_staging_to_dwh_etl()
+    
+    # Kiểm tra kết quả
+    if etl_result.get("success", False):
+        logger.info("✅ ETL HOÀN THÀNH THÀNH CÔNG!")
+        sys.exit(0)
+    else:
+        logger.error(f"❌ ETL THẤT BẠI: {etl_result.get('message', 'Unknown error')}")
+        sys.exit(1)
