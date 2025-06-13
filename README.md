@@ -48,8 +48,3 @@ Run the test suite to verify the pipeline's functionality:
 pytest tests/
 ```
 
-## Contribution Guidelines
-We welcome contributions! Please fork the repository and submit a pull request with your changes.
-
-## License Information
-This project is licensed under the MIT License. See the LICENSE file for more details.
