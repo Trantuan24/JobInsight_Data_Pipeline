@@ -1,6 +1,7 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import shutil
 from typing import Dict, Any, List
 import pandas as pd
 import sys
@@ -132,3 +133,94 @@ def list_cdc_files(days_back: int = 7) -> List[str]:
                     result.append(os.path.join(cdc_dir_dated, file))
     
     return sorted(result) 
+
+def cleanup_old_cdc_files(days_to_keep: int = 30) -> Dict[str, int]:
+    """
+    Xóa các file CDC cũ hơn số ngày chỉ định
+    
+    Args:
+        days_to_keep: Số ngày dữ liệu CDC cần giữ lại, mặc định là 30 ngày
+    
+    Returns:
+        Dict[str, int]: Thống kê về số lượng thư mục, file đã xóa và lỗi nếu có
+    """
+    logger.info(f"Bắt đầu dọn dẹp các file CDC cũ hơn {days_to_keep} ngày")
+    
+    stats = {
+        'dirs_removed': 0, 
+        'files_removed': 0, 
+        'errors': 0,
+        'bytes_freed': 0
+    }
+    
+    try:
+        # Tính ngày giới hạn
+        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+        
+        # Quét qua các thư mục theo năm-tháng
+        if os.path.exists(CDC_DIR):
+            for year_month in os.listdir(CDC_DIR):
+                year_month_path = os.path.join(CDC_DIR, year_month)
+                
+                # Bỏ qua nếu không phải thư mục
+                if not os.path.isdir(year_month_path):
+                    continue
+                    
+                # Kiểm tra từng thư mục ngày
+                for day in os.listdir(year_month_path):
+                    day_path = os.path.join(year_month_path, day)
+                    
+                    # Bỏ qua nếu không phải thư mục
+                    if not os.path.isdir(day_path):
+                        continue
+                        
+                    try:
+                        # Parse ngày từ tên thư mục
+                        folder_date_str = f"{year_month}{day}"
+                        folder_date = datetime.strptime(folder_date_str, "%Y%m%d")
+                        
+                        # Nếu thư mục cũ hơn ngày giới hạn, xóa toàn bộ
+                        if folder_date < cutoff_date:
+                            # Tính kích thước thư mục trước khi xóa
+                            dir_size = sum(os.path.getsize(os.path.join(root, file)) 
+                                      for root, dirs, files in os.walk(day_path) 
+                                      for file in files)
+                            
+                            # Đếm số file bị xóa
+                            file_count = sum(len(files) for _, _, files in os.walk(day_path))
+                            
+                            # Xóa thư mục và toàn bộ nội dung
+                            shutil.rmtree(day_path)
+                            
+                            stats['dirs_removed'] += 1
+                            stats['files_removed'] += file_count
+                            stats['bytes_freed'] += dir_size
+                            
+                            logger.info(f"Đã xóa thư mục CDC: {day_path} ({file_count} files, {dir_size} bytes)")
+                    except ValueError as e:
+                        # Lỗi parse ngày từ tên thư mục
+                        logger.warning(f"Không thể xác định ngày từ thư mục: {day_path}, lỗi: {str(e)}")
+                        stats['errors'] += 1
+                    except Exception as e:
+                        logger.error(f"Lỗi khi xóa thư mục CDC {day_path}: {str(e)}")
+                        stats['errors'] += 1
+                
+                # Kiểm tra và xóa các thư mục tháng rỗng
+                try:
+                    if not os.listdir(year_month_path):
+                        os.rmdir(year_month_path)
+                        logger.info(f"Đã xóa thư mục tháng rỗng: {year_month_path}")
+                except Exception as e:
+                    logger.error(f"Lỗi khi xóa thư mục tháng rỗng {year_month_path}: {str(e)}")
+                    stats['errors'] += 1
+        
+        # Format kích thước để dễ đọc
+        freed_mb = stats['bytes_freed'] / (1024 * 1024)
+        logger.info(f"Hoàn tất dọn dẹp CDC: Đã xóa {stats['dirs_removed']} thư mục, "
+                   f"{stats['files_removed']} files ({freed_mb:.2f} MB), {stats['errors']} lỗi")
+        
+        return stats
+    except Exception as e:
+        logger.error(f"Lỗi trong quá trình dọn dẹp CDC: {str(e)}")
+        stats['errors'] += 1
+        return stats 
