@@ -45,15 +45,26 @@ standalone_admin_password.txt
 # Backup HTML files
 raw_backup/
 
-# Data & Results
-data/
+# Data & Results - Giữ cấu trúc thư mục nhưng ẩn nội dung
+# Không ẩn toàn bộ thư mục data nữa
+# data/
 results/
+
+# Ẩn các file dữ liệu
 *.csv
 *.json
 *.parquet
+*.db
 
-# CDC files
-data/cdc/
+# Ẩn nội dung trong thư mục cdc nhưng giữ cấu trúc
+data/cdc/**/*.jsonl
+
+# Ẩn nội dung trong thư mục duck_db nhưng giữ cấu trúc
+data/duck_db/**/*.db
+data/duck_db/**/*.wal
+
+# Ẩn nội dung trong thư mục parquet nhưng giữ cấu trúc
+data/parquet/**/*.parquet
 
 # Logs
 *.log
