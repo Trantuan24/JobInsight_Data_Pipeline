@@ -1,134 +1,192 @@
--- Hàm chuyển đổi salary_text thành salary_min, salary_max và salary_type
-CREATE OR REPLACE FUNCTION normalize_salary(salary_text VARCHAR)
-RETURNS TABLE(
-    salary_min FLOAT,
-    salary_max FLOAT,
-    salary_type VARCHAR
-) AS $$
+/* =======================================================================
+   1. Hàm chuẩn hoá lương
+   =======================================================================*/
+DROP FUNCTION IF EXISTS jobinsight_staging.normalize_salary(text);
+
+CREATE FUNCTION jobinsight_staging.normalize_salary(salary_text text)
+RETURNS TABLE (
+    salary_min  numeric,
+    salary_max  numeric,
+    salary_type varchar
+)
+LANGUAGE plpgsql
+AS $$
 DECLARE
-    matches TEXT[];
-    usd_exchange_rate FLOAT := 24000;
+    matches           text[];
+    usd_exchange_rate numeric := 24000;          -- 1 USD ≈ 24 000 VND
 BEGIN
-    IF salary_text IS NULL OR salary_text = '' OR lower(salary_text) = 'thoả thuận' THEN
-        salary_min := 0;
-        salary_max := 0;
+    /* 1. Thoả thuận hoặc trống */
+    IF salary_text IS NULL
+       OR salary_text = ''
+       OR lower(salary_text) = 'thoả thuận' THEN
+        salary_min  := 0;
+        salary_max  := 0;
         salary_type := 'negotiable';
 
+    /* 2. Dạng "x - y USD" */
     ELSIF salary_text ~* '([0-9,.]+)\s*-\s*([0-9,.]+)\s*usd' THEN
-        matches := regexp_matches(salary_text, '([0-9,.]+)\s*-\s*([0-9,.]+)\s*usd', 'i');
-        salary_min := replace(matches[1], ',', '')::FLOAT * usd_exchange_rate / 1000000;
-        salary_max := replace(matches[2], ',', '')::FLOAT * usd_exchange_rate / 1000000;
+        matches     := regexp_matches(salary_text,
+                       '([0-9,.]+)\s*-\s*([0-9,.]+)\s*usd', 'i');
+        salary_min  := replace(matches[1], ',', '')::numeric
+                       * usd_exchange_rate / 1e6;
+        salary_max  := replace(matches[2], ',', '')::numeric
+                       * usd_exchange_rate / 1e6;
         salary_type := 'range';
 
+    /* 3. Dạng "x - y triệu" */
     ELSIF salary_text ~* '([0-9,.]+)\s*-\s*([0-9,.]+)\s*triệu' THEN
-        matches := regexp_matches(salary_text, '([0-9,.]+)\s*-\s*([0-9,.]+)\s*triệu', 'i');
-        salary_min := replace(matches[1], ',', '.')::FLOAT;
-        salary_max := replace(matches[2], ',', '.')::FLOAT;
+        matches     := regexp_matches(salary_text,
+                       '([0-9,.]+)\s*-\s*([0-9,.]+)\s*triệu', 'i');
+        salary_min  := replace(matches[1], ',', '.')::numeric;
+        salary_max  := replace(matches[2], ',', '.')::numeric;
         salary_type := 'range';
 
+    /* 4. Dạng "tới x USD/triệu" */
     ELSIF salary_text ~* 'tới\s+([0-9,.]+)\s*usd' THEN
-        matches := regexp_matches(salary_text, 'tới\s+([0-9,.]+)\s*usd', 'i');
-        salary_min := 0;
-        salary_max := replace(matches[1], ',', '')::FLOAT * usd_exchange_rate / 1000000;
+        matches     := regexp_matches(salary_text,
+                       'tới\s+([0-9,.]+)\s*usd', 'i');
+        salary_min  := 0;
+        salary_max  := replace(matches[1], ',', '')::numeric
+                       * usd_exchange_rate / 1e6;
         salary_type := 'upto';
 
     ELSIF salary_text ~* 'tới\s+([0-9,.]+)\s*triệu' THEN
-        matches := regexp_matches(salary_text, 'tới\s+([0-9,.]+)\s*triệu', 'i');
-        salary_min := 0;
-        salary_max := replace(matches[1], ',', '.')::FLOAT;
+        matches     := regexp_matches(salary_text,
+                       'tới\s+([0-9,.]+)\s*triệu', 'i');
+        salary_min  := 0;
+        salary_max  := replace(matches[1], ',', '.')::numeric;
         salary_type := 'upto';
 
+    /* 5. Dạng "từ x triệu" */
     ELSIF salary_text ~* 'từ\s+([0-9,.]+)\s*triệu' THEN
-        matches := regexp_matches(salary_text, 'từ\s+([0-9,.]+)\s*triệu', 'i');
-        salary_min := replace(matches[1], ',', '.')::FLOAT;
-        salary_max := salary_min;
+        matches     := regexp_matches(salary_text,
+                       'từ\s+([0-9,.]+)\s*triệu', 'i');
+        salary_min  := replace(matches[1], ',', '.')::numeric;
+        salary_max  := salary_min;
         salary_type := 'from';
 
-    ELSIF salary_text ~* '([0-9,.]+)\s*usd' AND salary_text !~* '-' THEN
-        matches := regexp_matches(salary_text, '([0-9,.]+)\s*usd', 'i');
-        salary_min := replace(matches[1], ',', '')::FLOAT * usd_exchange_rate / 1000000;
-        salary_max := salary_min;
+    /* 6. Chỉ 1 số USD/triệu (không có "-") */
+    ELSIF salary_text ~* '([0-9,.]+)\s*usd'
+          AND salary_text !~* '-' THEN
+        matches     := regexp_matches(salary_text,
+                       '([0-9,.]+)\s*usd', 'i');
+        salary_min  := replace(matches[1], ',', '')::numeric
+                       * usd_exchange_rate / 1e6;
+        salary_max  := salary_min;
         salary_type := 'range';
 
-    ELSIF salary_text ~* '([0-9,.]+)\s*triệu' AND salary_text !~* '-' THEN
-        matches := regexp_matches(salary_text, '([0-9,.]+)\s*triệu', 'i');
-        salary_min := replace(matches[1], ',', '.')::FLOAT;
-        salary_max := salary_min;
+    ELSIF salary_text ~* '([0-9,.]+)\s*triệu'
+          AND salary_text !~* '-' THEN
+        matches     := regexp_matches(salary_text,
+                       '([0-9,.]+)\s*triệu', 'i');
+        salary_min  := replace(matches[1], ',', '.')::numeric;
+        salary_max  := salary_min;
         salary_type := 'range';
 
+    /* 7. Trường hợp dữ liệu đặc biệt "0.0 - 0.0 triệu" */
     ELSIF salary_text = '0.0 - 0.0 triệu' THEN
-        salary_min := 0;
-        salary_max := 0;
+        salary_min  := 0;
+        salary_max  := 0;
         salary_type := 'negotiable';
 
+    /* 8. Mặc định */
     ELSE
-        salary_min := 0;
-        salary_max := 0;
+        salary_min  := 0;
+        salary_max  := 0;
         salary_type := 'negotiable';
     END IF;
 
-    IF salary_min IS NULL THEN
-        salary_min := 0;
-    END IF;
-
-    IF salary_max IS NULL OR salary_max = 0 THEN
-        salary_max := salary_min;
-    END IF;
+    /* Phòng ngừa NULL */
+    salary_min := coalesce(salary_min, 0);
+    salary_max := coalesce(NULLIF(salary_max, 0), salary_min);
 
     RETURN QUERY SELECT salary_min, salary_max, salary_type;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 
--- Thêm các cột nếu chưa tồn tại trong bảng staging
-ALTER TABLE jobinsight_staging.staging_jobs ADD COLUMN IF NOT EXISTS salary_min FLOAT;
-ALTER TABLE jobinsight_staging.staging_jobs ADD COLUMN IF NOT EXISTS salary_max FLOAT;
-ALTER TABLE jobinsight_staging.staging_jobs ADD COLUMN IF NOT EXISTS salary_type VARCHAR;
+/* =======================================================================
+   2. Thêm cột cho bảng staging (nếu chưa có)
+   =======================================================================*/
+ALTER TABLE jobinsight_staging.staging_jobs
+    ADD COLUMN IF NOT EXISTS salary_min    numeric,
+    ADD COLUMN IF NOT EXISTS salary_max    numeric,
+    ADD COLUMN IF NOT EXISTS salary_type   varchar,
+    ADD COLUMN IF NOT EXISTS due_date      timestamptz,
+    ADD COLUMN IF NOT EXISTS time_remaining text;
 
-ALTER TABLE jobinsight_staging.staging_jobs ADD COLUMN IF NOT EXISTS due_date TIMESTAMP WITH TIME ZONE;
-ALTER TABLE jobinsight_staging.staging_jobs ADD COLUMN IF NOT EXISTS time_remaining TEXT;
 
+/* =======================================================================
+   3. Cập nhật lương & hạn nộp
+   =======================================================================*/
 
--- Cập nhật giá trị salary_min, salary_max, salary_type trong staging
+/* 3.1. Tính lại lương */
 UPDATE jobinsight_staging.staging_jobs
-SET (salary_min, salary_max, salary_type) = (
-    SELECT n.salary_min, n.salary_max, n.salary_type
-    FROM normalize_salary(jobinsight_staging.staging_jobs.salary) AS n
-);
+SET (salary_min, salary_max, salary_type) = (n.salary_min, n.salary_max, n.salary_type)
+FROM jobinsight_staging.staging_jobs AS s
+CROSS JOIN jobinsight_staging.normalize_salary(s.salary) AS n
+WHERE jobinsight_staging.staging_jobs.job_id = s.job_id
+  AND (jobinsight_staging.staging_jobs.salary_min, jobinsight_staging.staging_jobs.salary_max, jobinsight_staging.staging_jobs.salary_type) 
+      IS DISTINCT FROM (n.salary_min, n.salary_max, n.salary_type);
 
-
--- Cập nhật cột due_date (thời hạn thực tế)
+/* 3.2. Xác định due_date từ "deadline (số ngày)" nếu chưa có */
 UPDATE jobinsight_staging.staging_jobs
-SET due_date = crawled_at + (deadline || ' days')::interval
-WHERE due_date IS NULL;
+SET    due_date = crawled_at + (deadline || ' days')::interval
+WHERE  due_date IS NULL;
 
 
--- Tạo thủ tục cập nhật thời gian còn lại
-CREATE OR REPLACE PROCEDURE update_deadline()
+/* =======================================================================
+   4. Thủ tục cập nhật time_remaining
+   =======================================================================*/
+DROP PROCEDURE IF EXISTS jobinsight_staging.update_deadline();
+
+CREATE PROCEDURE jobinsight_staging.update_deadline()
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    /* > 1 ngày */
     UPDATE jobinsight_staging.staging_jobs
-    SET time_remaining = 'Còn ' || EXTRACT(DAY FROM (due_date - CURRENT_TIMESTAMP))::INT || ' ngày để ứng tuyển'
-    WHERE due_date > CURRENT_TIMESTAMP AND due_date - CURRENT_TIMESTAMP >= INTERVAL '1 day';
+    SET    time_remaining = 'Còn '
+           || EXTRACT(day FROM (due_date - CURRENT_TIMESTAMP))::int
+           || ' ngày để ứng tuyển'
+    WHERE  due_date > CURRENT_TIMESTAMP
+      AND  due_date - CURRENT_TIMESTAMP >= INTERVAL '1 day';
 
+    /* 1 giờ – < 1 ngày */
     UPDATE jobinsight_staging.staging_jobs
-    SET time_remaining = 'Còn ' || EXTRACT(HOUR FROM (due_date - CURRENT_TIMESTAMP))::INT || ' giờ để ứng tuyển'
-    WHERE due_date > CURRENT_TIMESTAMP AND due_date - CURRENT_TIMESTAMP >= INTERVAL '1 hour' AND due_date - CURRENT_TIMESTAMP < INTERVAL '1 day';
+    SET    time_remaining = 'Còn '
+           || EXTRACT(hour FROM (due_date - CURRENT_TIMESTAMP))::int
+           || ' giờ để ứng tuyển'
+    WHERE  due_date > CURRENT_TIMESTAMP
+      AND  due_date - CURRENT_TIMESTAMP >= INTERVAL '1 hour'
+      AND  due_date - CURRENT_TIMESTAMP <  INTERVAL '1 day';
 
+    /* 1 phút – < 1 giờ */
     UPDATE jobinsight_staging.staging_jobs
-    SET time_remaining = 'Còn ' || EXTRACT(MINUTE FROM (due_date - CURRENT_TIMESTAMP))::INT || ' phút để ứng tuyển'
-    WHERE due_date > CURRENT_TIMESTAMP AND due_date - CURRENT_TIMESTAMP >= INTERVAL '1 minute' AND due_date - CURRENT_TIMESTAMP < INTERVAL '1 hour';
+    SET    time_remaining = 'Còn '
+           || EXTRACT(minute FROM (due_date - CURRENT_TIMESTAMP))::int
+           || ' phút để ứng tuyển'
+    WHERE  due_date > CURRENT_TIMESTAMP
+      AND  due_date - CURRENT_TIMESTAMP >= INTERVAL '1 minute'
+      AND  due_date - CURRENT_TIMESTAMP <  INTERVAL '1 hour';
 
+    /* < 1 phút */
     UPDATE jobinsight_staging.staging_jobs
-    SET time_remaining = 'Còn ' || EXTRACT(SECOND FROM (due_date - CURRENT_TIMESTAMP))::INT || ' giây để ứng tuyển'
-    WHERE due_date > CURRENT_TIMESTAMP AND due_date - CURRENT_TIMESTAMP < INTERVAL '1 minute';
+    SET    time_remaining = 'Còn '
+           || EXTRACT(second FROM (due_date - CURRENT_TIMESTAMP))::int
+           || ' giây để ứng tuyển'
+    WHERE  due_date > CURRENT_TIMESTAMP
+      AND  due_date - CURRENT_TIMESTAMP < INTERVAL '1 minute';
 
+    /* Hết hạn */
     UPDATE jobinsight_staging.staging_jobs
-    SET time_remaining = 'Đã hết thời gian ứng tuyển'
-    WHERE due_date <= CURRENT_TIMESTAMP;
+    SET    time_remaining = 'Đã hết thời gian ứng tuyển'
+    WHERE  due_date <= CURRENT_TIMESTAMP;
 END;
 $$;
 
--- Gọi thủ tục cập nhật deadline
-CALL update_deadline();
+
+/* =======================================================================
+   5. Gọi thủ tục ngay lần đầu
+   =======================================================================*/
+CALL jobinsight_staging.update_deadline();

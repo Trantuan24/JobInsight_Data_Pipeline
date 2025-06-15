@@ -180,20 +180,36 @@ def execute_stored_procedure(procedure_name, params=None):
 
 # Hàm tiện ích
 def execute_sql_file(sql_file_path):
-    """Thực thi file SQL"""
+    """
+    Thực thi file SQL
+    
+    Args:
+        sql_file_path (str): Đường dẫn đến file SQL cần thực thi
+        
+    Returns:
+        bool: True nếu thành công, False nếu thất bại
+    """
     try:
         with open(sql_file_path, 'r', encoding='utf-8') as f:
             sql_script = f.read()
         
+        # Thực thi toàn bộ file SQL như một khối lệnh duy nhất
+        # thay vì cắt theo dấu chấm phẩy
         with get_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(sql_script)
-                conn.commit()
+                try:
+                    cursor.execute(sql_script)
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"Lỗi khi thực thi SQL file: {sql_file_path}")
+                    logger.error(f"Chi tiết lỗi: {type(e).__name__}: {str(e)}")
+                    return False
         
         logger.info(f"Đã thực thi thành công file SQL: {sql_file_path}")
         return True
     except Exception as e:
         logger.error(f"Lỗi khi thực thi file SQL {sql_file_path}: {str(e)}")
+        logger.error(f"Chi tiết lỗi: {type(e).__name__}: {str(e)}")
         return False
     
-

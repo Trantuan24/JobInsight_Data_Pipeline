@@ -23,8 +23,7 @@ CREATE TABLE IF NOT EXISTS jobinsight_staging.staging_jobs (
     posted_time TIMESTAMP WITH TIME ZONE,
     crawled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     due_date TIMESTAMP WITH TIME ZONE,
-    time_remaining TEXT,
-    raw_data JSONB
+    time_remaining TEXT
 );
 
 CREATE INDEX IF NOT EXISTS staging_jobs_company_idx ON jobinsight_staging.staging_jobs(company_name);
@@ -33,45 +32,4 @@ CREATE INDEX IF NOT EXISTS staging_jobs_posted_time_idx ON jobinsight_staging.st
 CREATE INDEX IF NOT EXISTS staging_jobs_crawled_at_idx ON jobinsight_staging.staging_jobs(crawled_at);
 
 COMMENT ON TABLE jobinsight_staging.staging_jobs IS 'Bảng Staging lưu dữ liệu từ TopCV';
-
-
-INSERT INTO jobinsight_staging.staging_jobs(
-	job_id,
-	title,
-    title_clean,
-	job_url,
-	company_name,
-	company_url,
-	salary,
-	skills,
-	location,
-	location_detail,
-	deadline,
-	verified_employer,
-	last_update,
-	logo_url,
-	posted_time,
-	crawled_at,
-	raw_data
-)
-SELECT
-	job_id,
-	title,
-    title,
-	job_url,
-	company_name,
-	company_url,
-	salary,
-	skills,
-	location,
-	location_detail,
-	deadline,
-	verified_employer,
-	last_update,
-	logo_url,
-	posted_time,
-	crawled_at,
-	raw_data
-FROM public.raw_jobs
-ON CONFLICT (job_id) DO NOTHING;
 

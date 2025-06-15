@@ -97,6 +97,46 @@ def setup_database_schema():
             return False
         
         logger.info("Đã thiết lập schema và bảng database thành công!")
+        
+        # Thực thi file insert_raw_to_staging.sql để chèn dữ liệu từ raw_jobs vào staging_jobs
+        insert_staging = os.path.join(SQL_DIR, "insert_raw_to_staging.sql")
+        if os.path.exists(insert_staging):
+            logger.info("Đang chèn dữ liệu từ raw_jobs vào staging_jobs...")
+            if not execute_sql_file(insert_staging):
+                logger.error("Không thể chèn dữ liệu từ raw_jobs vào staging_jobs!")
+                return False
+            logger.info("Đã chèn dữ liệu từ raw_jobs vào staging_jobs thành công!")
+        else:
+            logger.error(f"Không tìm thấy file insert: {insert_staging}")
+            return False
+        
+        # Đếm số bản ghi đã chèn
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) FROM {DWH_STAGING_SCHEMA}.staging_jobs")
+                record_count = cursor.fetchone()[0]
+                logger.info(f"Tìm thấy {record_count} bản ghi trong bảng staging_jobs")
+                
+                # Kiểm tra số lượng bản ghi trong raw_jobs
+                cursor.execute(f"SELECT COUNT(*) FROM public.raw_jobs")
+                raw_count = cursor.fetchone()[0]
+                logger.info(f"Số bản ghi trong raw_jobs: {raw_count}")
+                
+                # Thống kê dữ liệu
+                cursor.execute(f"SELECT COUNT(DISTINCT company_name) FROM {DWH_STAGING_SCHEMA}.staging_jobs")
+                company_count = cursor.fetchone()[0]
+                
+                cursor.execute(f"SELECT COUNT(DISTINCT location) FROM {DWH_STAGING_SCHEMA}.staging_jobs")
+                location_count = cursor.fetchone()[0]
+                
+                cursor.execute(f"SELECT COUNT(*), (COUNT(*) * 100.0 / {record_count}) FROM {DWH_STAGING_SCHEMA}.staging_jobs WHERE verified_employer = TRUE")
+                verified_count, verified_percent = cursor.fetchone()
+                
+                logger.info("Thống kê dữ liệu:")
+                logger.info(f"- Số công ty: {company_count}")
+                logger.info(f"- Số địa điểm: {location_count}")
+                logger.info(f"- Số nhà tuyển dụng đã xác thực: {verified_count} ({verified_percent:.1f}%)")
+        
         return True
     except Exception as e:
         logger.error(f"Lỗi khi thiết lập schema database: {str(e)}")
@@ -295,7 +335,7 @@ def run_etl():
         bool: Kết quả thực hiện
     """
     try:
-        logger.info("Bắt đầu quy trình ETL...")
+        logger.info("Bắt đầu ETL từ raw_jobs sang staging_jobs...")
         start_time = datetime.now()
         
         # 1. Thiết lập schema và bảng nếu cần
@@ -309,21 +349,29 @@ def run_etl():
             # Vẫn tiếp tục vì có thể một số SP đã chạy thành công
         
         # 3. Load dữ liệu từ staging để xử lý thêm bằng pandas
-        staging_df = load_staging_data()
-        source_count = len(staging_df)
-        
-        # 4. Xử lý chi tiết bằng pandas
-        processed_df = process_staging_data(staging_df)
-        processed_count = len(processed_df)
-        
-        # Kiểm tra tính toàn vẹn dữ liệu sau bước xử lý
-        if not verify_etl_integrity(source_count, processed_count):
-            logger.warning("Phát hiện mất mát dữ liệu trong quá trình xử lý!")
-            # Vẫn tiếp tục nhưng đã cảnh báo
-        
-        # 5. Lưu kết quả trở lại bảng staging
-        if not save_back_to_staging(processed_df):
-            logger.error("Không thể lưu kết quả vào bảng staging!")
+        try:
+            staging_df = load_staging_data()
+            source_count = len(staging_df)
+            
+            if source_count == 0:
+                logger.warning("Không có dữ liệu trong bảng staging_jobs để xử lý!")
+                return True  # Không có dữ liệu vẫn coi là thành công
+                
+            # 4. Xử lý chi tiết bằng pandas
+            processed_df = process_staging_data(staging_df)
+            processed_count = len(processed_df)
+            
+            # Kiểm tra tính toàn vẹn dữ liệu sau bước xử lý
+            if not verify_etl_integrity(source_count, processed_count):
+                logger.warning("Phát hiện mất mát dữ liệu trong quá trình xử lý!")
+                # Vẫn tiếp tục nhưng đã cảnh báo
+            
+            # 5. Lưu kết quả trở lại bảng staging
+            if not save_back_to_staging(processed_df):
+                logger.error("Không thể lưu kết quả vào bảng staging!")
+                return False
+        except Exception as e:
+            logger.error(f"Lỗi khi xử lý dữ liệu staging: {e}")
             return False
         
         # Tính thời gian chạy

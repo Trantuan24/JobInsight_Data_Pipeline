@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS DimDate (
     weekday VARCHAR(10)
 );
 
+-- Fact table với partition theo load_month và cập nhật đầy đủ
 CREATE TABLE IF NOT EXISTS FactJobPostingDaily (
     fact_id INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
     job_sk INTEGER NOT NULL,
@@ -67,8 +68,6 @@ CREATE TABLE IF NOT EXISTS FactJobLocationBridge (
     fact_id INTEGER NOT NULL,
     location_sk INTEGER NOT NULL,
     PRIMARY KEY (fact_id, location_sk)
-    -- FOREIGN KEY (fact_id) REFERENCES FactJobPostingDaily(fact_id),
-    -- FOREIGN KEY (location_sk) REFERENCES DimLocation(location_sk)
 );
 
 -- PHẦN 2: TẠO INDEXES
@@ -78,8 +77,12 @@ CREATE INDEX IF NOT EXISTS idx_dimlocation_current ON DimLocation(is_current);
 CREATE INDEX IF NOT EXISTS idx_fact_date ON FactJobPostingDaily(date_id);
 CREATE INDEX IF NOT EXISTS idx_fact_load_month ON FactJobPostingDaily(load_month);
 CREATE INDEX IF NOT EXISTS idx_fact_job_date ON FactJobPostingDaily(job_sk, date_id);
+CREATE INDEX IF NOT EXISTS idx_fact_company_date ON FactJobPostingDaily(company_sk, date_id);
+CREATE INDEX IF NOT EXISTS idx_dimcompany_name ON DimCompany(company_name_standardized) WHERE is_current = TRUE;
+CREATE INDEX IF NOT EXISTS idx_dimlocation_city ON DimLocation(city) WHERE is_current = TRUE;
 
 -- PHẦN 3: TẠO VIEWS
+-- View để dễ dàng truy vấn jobs hiện tại
 CREATE VIEW IF NOT EXISTS vw_current_jobs AS
 SELECT j.*, c.company_name_standardized, c.verified_employer
 FROM DimJob j
@@ -88,9 +91,48 @@ JOIN DimCompany c ON f.company_sk = c.company_sk
 WHERE j.is_current = TRUE
 AND c.is_current = TRUE;
 
+-- View cho location với denormalization
 CREATE VIEW IF NOT EXISTS vw_job_locations AS
 SELECT f.fact_id, f.job_sk, f.date_id, l.province, l.city, l.district
 FROM FactJobPostingDaily f
 JOIN FactJobLocationBridge b ON f.fact_id = b.fact_id
 JOIN DimLocation l ON b.location_sk = l.location_sk
 WHERE l.is_current = TRUE;
+
+-- View tổng hợp theo tháng (partitioned)
+CREATE VIEW IF NOT EXISTS vw_monthly_jobs AS 
+SELECT 
+    f.load_month,
+    DATE_TRUNC('month', f.date_id) AS month,
+    COUNT(DISTINCT f.job_sk) AS job_count,
+    COUNT(DISTINCT f.company_sk) AS company_count,
+    AVG(f.salary_min) AS avg_salary_min,
+    AVG(f.salary_max) AS avg_salary_max
+FROM FactJobPostingDaily f
+GROUP BY f.load_month, DATE_TRUNC('month', f.date_id)
+ORDER BY f.load_month, DATE_TRUNC('month', f.date_id);
+
+-- View hiển thị top công ty đăng nhiều job nhất
+CREATE VIEW IF NOT EXISTS vw_top_companies AS
+SELECT 
+    c.company_name_standardized,
+    c.verified_employer,
+    COUNT(DISTINCT f.job_sk) AS job_count
+FROM DimCompany c
+JOIN FactJobPostingDaily f ON c.company_sk = f.company_sk
+WHERE c.is_current = TRUE
+GROUP BY c.company_name_standardized, c.verified_employer
+ORDER BY job_count DESC;
+
+-- View hiển thị top locations
+CREATE VIEW IF NOT EXISTS vw_top_locations AS
+SELECT 
+    COALESCE(l.province, 'Unknown') AS province,
+    l.city, 
+    COUNT(DISTINCT f.job_sk) AS job_count
+FROM DimLocation l
+JOIN FactJobLocationBridge b ON l.location_sk = b.location_sk
+JOIN FactJobPostingDaily f ON b.fact_id = f.fact_id
+WHERE l.is_current = TRUE
+GROUP BY l.province, l.city
+ORDER BY job_count DESC;

@@ -95,7 +95,7 @@ def check_dimension_changes(
     dim_table: str,
     natural_key: str,
     compare_columns: List[str]
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, List[Dict], List[Dict]]:
     """
     Kiểm tra thay đổi trong dimension table (SCD Type 2)
     
@@ -109,13 +109,14 @@ def check_dimension_changes(
     Returns:
         Tuple chứa (records_to_insert, records_to_update, unchanged_records)
     """
-    records_to_insert = []
-    records_to_update = []
-    unchanged_records = []
+    to_insert = []
+    to_update = []
+    unchanged = []
     
     try:
+        # Xử lý từng bản ghi mới
         for _, new_record in new_records.iterrows():
-            natural_key_value = new_record[natural_key]
+            key_value = new_record[natural_key]
             
             # Tìm bản ghi hiện tại trong dimension
             query = f"""
@@ -123,120 +124,124 @@ def check_dimension_changes(
                 WHERE {natural_key} = ? AND is_current = TRUE
             """
             
-            existing = duck_conn.execute(query, [natural_key_value]).fetchdf()
+            existing = duck_conn.execute(query, [key_value]).fetchdf()
             
             if existing.empty:
                 # Bản ghi mới hoàn toàn
-                records_to_insert.append(new_record)
+                to_insert.append(new_record.to_dict())
             else:
                 # So sánh các trường để xem có thay đổi không
                 existing_record = existing.iloc[0]
                 has_changes = False
                 
                 for col in compare_columns:
-                    if col in new_record.index and col in existing_record.index:
-                        old_val = existing_record[col]
-                        new_val = new_record[col]
+                    if col in new_record and col in existing_record:
+                        if isinstance(new_record[col], (list, dict)):
+                            new_val_str = json.dumps(new_record[col])
+                        else:
+                            new_val_str = str(new_record[col]) if pd.notna(new_record[col]) else None
+                            
+                        if isinstance(existing_record[col], (list, dict)):
+                            old_val_str = json.dumps(existing_record[col])
+                        else:
+                            old_val_str = str(existing_record[col]) if pd.notna(existing_record[col]) else None
                         
-                        # Handle null values
-                        old_is_null = pd.isna(old_val) if old_val is not None else True
-                        new_is_null = pd.isna(new_val) if new_val is not None else True
-                        
-                        if old_is_null and new_is_null:
-                            continue
-                        elif old_is_null != new_is_null:
-                            has_changes = True
-                            break
-                        elif str(old_val) != str(new_val):
+                        if new_val_str != old_val_str:
                             has_changes = True
                             break
                 
                 if has_changes:
                     # Cần update: đóng record cũ và tạo record mới
-                    records_to_update.append({
-                        'old_record': existing_record,
-                        'new_record': new_record
+                    to_update.append({
+                        'old': existing_record.to_dict(),
+                        'new': new_record.to_dict()
                     })
                 else:
                     # Không có thay đổi
-                    unchanged_records.append(new_record)
-    
+                    unchanged.append(new_record.to_dict())
+                    
+        # Chuyển về DataFrames
+        to_insert_df = pd.DataFrame(to_insert) if to_insert else pd.DataFrame()
+        
+        logger.info(f"{dim_table}: {len(to_insert)} to insert, {len(to_update)} to update, {len(unchanged)} unchanged")
+        
+        return to_insert_df, to_update, unchanged
+        
     except Exception as e:
-        logger.error(f"Lỗi khi check dimension changes: {e}")
+        logger.error(f"Lỗi khi kiểm tra thay đổi dimension {dim_table}: {e}")
         # Fallback: coi tất cả là insert mới
-        records_to_insert = new_records.to_dict('records')
-    
-    return (
-        pd.DataFrame(records_to_insert) if records_to_insert else pd.DataFrame(),
-        records_to_update,
-        pd.DataFrame(unchanged_records) if unchanged_records else pd.DataFrame()
-    )
+        to_insert_df = new_records.copy()
+        return to_insert_df, [], []
 
-def apply_scd_type2_updates(duck_conn, dim_table: str, surrogate_key: str, updates: List[Dict]):
+def apply_scd_type2_updates(
+    duck_conn,
+    dim_table: str, 
+    surrogate_key: str,
+    updates: List[Dict]
+) -> int:
     """
-    Áp dụng SCD Type 2 updates: đóng bản ghi cũ và tạo bản ghi mới
+    Áp dụng SCD Type 2 updates cho dimension table:
+    1. Đóng bản ghi cũ (cập nhật expiry_date, is_current)
+    2. Tạo bản ghi mới dựa trên dữ liệu mới
     
     Args:
         duck_conn: Kết nối DuckDB
         dim_table: Tên bảng dimension
         surrogate_key: Tên cột surrogate key
-        updates: List các bản ghi cần update
+        updates: List các dict {'old': old_dict, 'new': new_dict}
+    
+    Returns:
+        Số lượng cập nhật thành công
     """
     today = datetime.now().date()
+    success_count = 0
     
-    for update_info in updates:
-        old_record = update_info['old_record']
-        new_record = update_info['new_record']
+    for update_pair in updates:
         try:
-            logger.info(f"Updating old record: {old_record.to_dict() if hasattr(old_record, 'to_dict') else old_record}")
-            logger.info(f"Surrogate key value: {old_record[surrogate_key]}")
+            old_record = update_pair['old']
+            new_record = update_pair['new']
+            
             # 1. Đóng bản ghi cũ
             update_query = f"""
                 UPDATE {dim_table}
                 SET expiry_date = ?, is_current = FALSE
                 WHERE {surrogate_key} = ?
             """
-            # Sửa thành:
-            surrogate_key_value = old_record[surrogate_key]
-            if hasattr(surrogate_key_value, 'item'):
-                surrogate_key_value = surrogate_key_value.item()  # Chuyển numpy.int32 -> int
-            duck_conn.execute(update_query, [today, surrogate_key_value])
+            duck_conn.execute(update_query, [today, old_record[surrogate_key]])
             
-            # 2. Insert bản ghi mới
-            new_record_dict = new_record.to_dict() if hasattr(new_record, 'to_dict') else dict(new_record)
-
-            # Loại bỏ mọi trường liên quan đến surrogate key (phòng trường hợp tên cột viết hoa/thường khác nhau)
-            for key in list(new_record_dict.keys()):
-                if key.lower() == surrogate_key.lower():
-                    del new_record_dict[key]
-
-            # Đặt effective_date và is_current
-            new_record_dict['effective_date'] = today
-            new_record_dict['is_current'] = True
-            new_record_dict['expiry_date'] = None
-
-            # Insert
-            columns = list(new_record_dict.keys())
+            # 2. Chuẩn bị record mới
+            # - Loại bỏ surrogate key để DBMS tự tạo
+            if surrogate_key in new_record:
+                del new_record[surrogate_key]
+                
+            # - Thêm thông tin SCD2
+            new_record['effective_date'] = today
+            new_record['expiry_date'] = None
+            new_record['is_current'] = True
+            
+            # Xử lý JSON nếu cần
+            for key, value in new_record.items():
+                if isinstance(value, (list, dict)):
+                    new_record[key] = json.dumps(value)
+            
+            # 3. Insert bản ghi mới
+            columns = list(new_record.keys())
             placeholders = ', '.join(['?'] * len(columns))
-            values = [new_record_dict[col] for col in columns]
-
-            # Handle JSON values
-            for i, val in enumerate(values):
-                if isinstance(val, (dict, list)):
-                    values[i] = json.dumps(val)
-
-            logger.info(f"Inserting new SCD2 record into {dim_table}: {new_record_dict}")
-
+            values = [new_record[col] for col in columns]
+            
             insert_query = f"""
                 INSERT INTO {dim_table} ({', '.join(columns)})
                 VALUES ({placeholders})
             """
             duck_conn.execute(insert_query, values)
             
-            logger.info(f"Updated {dim_table}: closed old record {old_record[surrogate_key]} and created new record")
+            success_count += 1
             
         except Exception as e:
-            logger.error(f"Lỗi khi apply SCD2 update cho {dim_table}: {e}")
+            logger.error(f"Lỗi khi thực hiện SCD2 update: {str(e)}")
+    
+    logger.info(f"Đã thực hiện {success_count}/{len(updates)} SCD2 updates cho {dim_table}")
+    return success_count
 
 def generate_daily_fact_records(
     posted_date: Optional[datetime], 
@@ -273,7 +278,7 @@ def generate_daily_fact_records(
     
     # Đảm bảo không tạo fact cho quá khứ xa hoặc tương lai xa
     min_date = (current_date - timedelta(days=90)).date()
-    max_date = (current_date + timedelta(days=365)).date()
+    max_date = (current_date + timedelta(days=180)).date()
     
     start_date = max(start_date, min_date)
     end_date = min(end_date, max_date)
@@ -288,7 +293,7 @@ def generate_daily_fact_records(
 
 def calculate_load_month(date_value: Any) -> str:
     """
-    Tính toán load_month từ date value
+    Tính toán load_month từ date value để dùng làm partition key
     
     Args:
         date_value: Giá trị date (có thể là datetime, date, hoặc string)
@@ -301,11 +306,10 @@ def calculate_load_month(date_value: Any) -> str:
             date_value = datetime.now()
         elif isinstance(date_value, str):
             date_value = pd.to_datetime(date_value)
-        elif hasattr(date_value, 'date'):
-            date_value = date_value
         
         return date_value.strftime('%Y-%m')
-    except:
+    except Exception as e:
+        logger.warning(f"Lỗi khi tính load_month: {e}, sử dụng tháng hiện tại")
         return datetime.now().strftime('%Y-%m')
 
 def generate_date_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
@@ -334,18 +338,14 @@ def generate_date_range(start_date: datetime, end_date: datetime) -> pd.DataFram
     
     return pd.DataFrame(date_records)
 
-
 def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     """
     Chuẩn bị dữ liệu cho bảng DimLocation với xử lý province, city, district
     
     Logic xử lý:
-    1. Cặp "value1:value2" có 2 dạng:
-       - "province:city" (nhận biết bởi có "TP" trong value2)
-       - "city:district" (không có "TP" trong value2)
-    2. Dạng chỉ có "city" riêng lẻ
-    3. List nhiều cặp sẽ được tách từng cặp riêng biệt
-    4. Xét trùng lặp dựa trên 3 cột: (province, city, district)
+    - Dựa trên location_pairs và location
+    - Mỗi record là một (province, city, district) duy nhất
+    - Bridge table sau đó sẽ map nhiều location cho 1 job
     
     Args:
         staging_records: Dữ liệu từ staging
@@ -355,124 +355,6 @@ def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("Chuẩn bị dữ liệu cho DimLocation")
     locations = []
-    
-    def parse_location_pair(pair_str):
-        """
-        Parse location pair string và trả về (province, city, districts_list)
-        
-        Args:
-            pair_str: String dạng "value1:value2" hoặc "value"
-            
-        Returns:
-            tuple: (province, city, districts_list)
-        """
-        province = None
-        city = None
-        districts = []
-        
-        if not isinstance(pair_str, str) or not pair_str.strip():
-            return province, city, districts
-            
-        pair_str = pair_str.strip()
-        
-        if ":" in pair_str:
-            parts = pair_str.split(":", 1)
-            if len(parts) == 2:
-                part1, part2 = parts[0].strip(), parts[1].strip()
-                
-                # Kiểm tra xem có phải "province:city" không (có "TP" trong part2)
-                if "TP" in part2.upper():
-                    # Dạng "Tỉnh ABC:TP XYZ"
-                    province = part1
-                    city = part2
-                    districts = []  # Không có district
-                else:
-                    # Dạng "City:District1, District2, ..."
-                    city = part1
-                    # Tách districts bằng dấu phẩy
-                    if "," in part2:
-                        districts = [d.strip() for d in part2.split(",") if d.strip()]
-                    else:
-                        districts = [part2] if part2 else []
-        else:
-            # Chỉ có city riêng lẻ
-            city = pair_str
-            districts = []
-        
-        return province, city, districts
-    
-    def extract_location_pairs_list(record):
-        """Trích xuất danh sách location pairs từ record"""
-        location_pairs_list = []
-        
-        # Xử lý trường location_pairs nếu có
-        if 'location_pairs' in record:
-            location_pairs_value = record['location_pairs']
-            
-            # Kiểm tra null an toàn
-            try:
-                is_null = pd.isna(location_pairs_value)
-                # Nếu là array, kiểm tra all null
-                if hasattr(is_null, '__len__') and len(is_null) > 1:
-                    is_null = is_null.all()
-            except (ValueError, TypeError):
-                # Fallback: check directly
-                is_null = location_pairs_value is None or str(location_pairs_value).lower() in ['nan', 'none', '']
-            
-            if not is_null:
-                if isinstance(location_pairs_value, list):
-                    # Đã là list
-                    location_pairs_list = location_pairs_value
-                elif isinstance(location_pairs_value, str):
-                    try:
-                        # Thử parse JSON
-                        parsed = json.loads(location_pairs_value)
-                        if isinstance(parsed, list):
-                            location_pairs_list = parsed
-                        else:
-                            location_pairs_list = [str(parsed)]
-                    except json.JSONDecodeError:
-                        # Không phải JSON, coi như string thường
-                        location_pairs_list = [location_pairs_value]
-                else:
-                    # Các kiểu khác, convert thành string
-                    location_pairs_list = [str(location_pairs_value)]
-        
-        # Nếu không có location_pairs hoặc rỗng, dùng trường location
-        if not location_pairs_list and 'location' in record:
-            location_value = record['location']
-            
-            # Kiểm tra null an toàn cho location
-            try:
-                is_null = pd.isna(location_value)
-                if hasattr(is_null, '__len__') and len(is_null) > 1:
-                    is_null = is_null.all()
-            except (ValueError, TypeError):
-                is_null = location_value is None or str(location_value).lower() in ['nan', 'none', '']
-            
-            if not is_null:
-                location_value = str(location_value).strip()
-                
-                # Kiểm tra định dạng "City │ District1, District2"
-                if "│" in location_value:
-                    location_parts = location_value.split("│", 1)
-                    if len(location_parts) == 2:
-                        city = location_parts[0].strip()
-                        districts_str = location_parts[1].strip()
-                        # Tạo các cặp "city:district"
-                        if "," in districts_str:
-                            for district in districts_str.split(","):
-                                if district.strip():
-                                    location_pairs_list.append(f"{city}:{district.strip()}")
-                        else:
-                            location_pairs_list.append(f"{city}:{districts_str}")
-                    else:
-                        location_pairs_list = [location_value]
-                else:
-                    # Chỉ có city
-                    location_pairs_list = [location_value]
-        
-        return location_pairs_list
     
     # Xử lý từng bản ghi staging
     for _, record in staging_records.iterrows():
@@ -534,18 +416,174 @@ def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"  - Có city: {location_df['city'].notna().sum()}")
     logger.info(f"  - Có district: {location_df['district'].notna().sum()}")
     
-    # Log một vài examples
-    logger.info("Một vài ví dụ DimLocation:")
-    for i, row in location_df.head(10).iterrows():
-        logger.info(f"  {row['province']} | {row['city']} | {row['district']}")
-    
     return location_df
+
+def parse_location_pair(pair_str):
+    """
+    Parse location pair string và trả về (province, city, districts_list)
+    
+    Args:
+        pair_str: String dạng "value1:value2" hoặc "value"
+        
+    Returns:
+        tuple: (province, city, districts_list)
+    """
+    province = None
+    city = None
+    districts = []
+    
+    if not isinstance(pair_str, str) or not pair_str.strip():
+        return province, city, districts
+        
+    pair_str = pair_str.strip()
+    
+    if ":" in pair_str:
+        parts = pair_str.split(":", 1)
+        if len(parts) == 2:
+            part1, part2 = parts[0].strip(), parts[1].strip()
+            
+            # Kiểm tra xem có phải "province:city" không (có "TP" trong part2)
+            if "TP" in part2.upper():
+                # Dạng "Tỉnh ABC:TP XYZ"
+                province = part1
+                city = part2
+                districts = []  # Không có district
+            else:
+                # Dạng "City:District1, District2, ..."
+                city = part1
+                # Tách districts bằng dấu phẩy
+                if "," in part2:
+                    districts = [d.strip() for d in part2.split(",") if d.strip()]
+                else:
+                    districts = [part2] if part2 else []
+    else:
+        # Chỉ có city riêng lẻ
+        city = pair_str
+        districts = []
+    
+    return province, city, districts
+
+def extract_location_pairs_list(record):
+    """
+    Trích xuất danh sách location pairs từ record
+    
+    Args:
+        record: Dict hoặc Series chứa dữ liệu 
+    
+    Returns:
+        List các location pairs
+    """
+    location_pairs_list = []
+    
+    # Xử lý trường location_pairs nếu có
+    if 'location_pairs' in record:
+        location_pairs_value = record['location_pairs']
+        
+        # Kiểm tra null an toàn
+        if pd.notna(location_pairs_value):
+            if isinstance(location_pairs_value, list):
+                # Đã là list
+                location_pairs_list = location_pairs_value
+            elif isinstance(location_pairs_value, str):
+                try:
+                    # Thử parse JSON
+                    parsed = json.loads(location_pairs_value)
+                    if isinstance(parsed, list):
+                        location_pairs_list = parsed
+                    else:
+                        location_pairs_list = [str(parsed)]
+                except json.JSONDecodeError:
+                    # Không phải JSON, coi như string thường
+                    location_pairs_list = [location_pairs_value]
+            else:
+                # Các kiểu khác, convert thành string
+                location_pairs_list = [str(location_pairs_value)]
+    
+    # Nếu không có location_pairs hoặc rỗng, dùng trường location
+    if not location_pairs_list and 'location' in record:
+        location_value = record['location']
+        
+        # Kiểm tra null
+        if pd.notna(location_value):
+            location_value = str(location_value).strip()
+            
+            # Kiểm tra định dạng "City │ District1, District2"
+            if "│" in location_value:
+                location_parts = location_value.split("│", 1)
+                if len(location_parts) == 2:
+                    city = location_parts[0].strip()
+                    districts_str = location_parts[1].strip()
+                    # Tạo các cặp "city:district"
+                    if "," in districts_str:
+                        for district in districts_str.split(","):
+                            if district.strip():
+                                location_pairs_list.append(f"{city}:{district.strip()}")
+                    else:
+                        location_pairs_list.append(f"{city}:{districts_str}")
+                else:
+                    location_pairs_list = [location_value]
+            else:
+                # Chỉ có city
+                location_pairs_list = [location_value]
+    
+    return location_pairs_list
+
+def parse_job_location(location_str: str) -> List[Tuple[str, str, str]]:
+    """
+    Parse location string từ job thành list các tuple (province, city, district)
+    
+    Args:
+        location_str: String location từ job data
+        
+    Returns:
+        List các tuple (province, city, district)
+    """
+    locations = []
+    
+    if not isinstance(location_str, str) or not location_str.strip():
+        return [(None, 'Unknown', None)]
+    
+    # Parse JSON list nếu có
+    location_items = []
+    try:
+        # Thử parse JSON
+        parsed_list = json.loads(location_str)
+        if isinstance(parsed_list, list):
+            location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
+        else:
+            location_items = [location_str.strip()]
+    except (json.JSONDecodeError, TypeError):
+        # Nếu không parse được JSON, thử parse format ['item1', 'item2']
+        try:
+            if location_str.strip().startswith('[') and location_str.strip().endswith(']'):
+                import ast
+                parsed_list = ast.literal_eval(location_str)
+                if isinstance(parsed_list, list):
+                    location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
+                else:
+                    location_items = [location_str.strip()]
+            else:
+                location_items = [location_str.strip()]
+        except (ValueError, SyntaxError):
+            location_items = [location_str.strip()]
+    
+    # Xử lý từng location item RIÊNG BIỆT
+    for item in location_items:
+        if not item or not item.strip():
+            continue
+        item = item.strip()
+        
+        # Parse 1 item
+        parsed_locations = parse_single_location_item(item)
+        locations.extend(parsed_locations)
+    
+    return locations if locations else [(None, 'Unknown', None)]
 
 def parse_single_location_item(item: str) -> List[Tuple[str, str, str]]:
     """
     Parse một location item riêng lẻ thành các tuple (province, city, district)
     
-    Xử lý patterns:
+    Xử lý các định dạng:
     - "Hà Nội: Thanh Xuân, Đống Đa" -> [(None, 'Hà Nội', 'Thanh Xuân'), (None, 'Hà Nội', 'Đống Đa')]
     - "Hà Nội: Cầu Giấy" -> [(None, 'Hà Nội', 'Cầu Giấy')]
     - "Hồ Chí Minh" -> [(None, 'Hồ Chí Minh', None)]
@@ -601,61 +639,3 @@ def parse_single_location_item(item: str) -> List[Tuple[str, str, str]]:
         locations.append((None, item, None))
     
     return locations
-
-def parse_job_location(location_str: str) -> List[Tuple[str, str, str]]:
-    """
-    Parse location string từ job thành list các tuple (province, city, district)
-    
-    Logic parsing MỚI:
-    1. Nếu array element chứa dấu phẩy -> tách districts trong cùng 1 city: 
-       "Hà Nội: Thanh Xuân, Đống Đa" -> [(None, 'Hà Nội', 'Thanh Xuân'), (None, 'Hà Nội', 'Đống Đa')]
-    2. Nếu array elements riêng biệt -> mỗi element là location độc lập:
-       ["Hà Nội: Đống Đa", "Hồ Chí Minh", "Bình Dương"] -> 3 locations riêng biệt
-    
-    Args:
-        location_str: String location từ job data
-        
-    Returns:
-        List các tuple (province, city, district)
-    """
-    locations = []
-    
-    if not isinstance(location_str, str) or not location_str.strip():
-        return [(None, 'Unknown', None)]
-    
-    # Parse JSON list nếu có
-    location_items = []
-    try:
-        import json
-        # Thử parse JSON trước
-        parsed_list = json.loads(location_str)
-        if isinstance(parsed_list, list):
-            location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
-        else:
-            location_items = [location_str.strip()]
-    except (json.JSONDecodeError, TypeError):
-        # Nếu không parse được JSON, thử parse format ['item1', 'item2'] bằng eval
-        try:
-            if location_str.strip().startswith('[') and location_str.strip().endswith(']'):
-                import ast
-                parsed_list = ast.literal_eval(location_str)
-                if isinstance(parsed_list, list):
-                    location_items = [str(item).strip() for item in parsed_list if str(item).strip()]
-                else:
-                    location_items = [location_str.strip()]
-            else:
-                location_items = [location_str.strip()]
-        except (ValueError, SyntaxError):
-            location_items = [location_str.strip()]
-    
-    # Xử lý từng location item RIÊNG BIỆT - không dùng context cross-item
-    for item in location_items:
-        if not item or not item.strip():
-            continue
-        item = item.strip()
-        
-        # Parse 1 item - có thể chứa comma-separated districts
-        item_locations = parse_single_location_item(item)
-        locations.extend(item_locations)
-    
-    return locations if locations else [(None, 'Unknown', None)]

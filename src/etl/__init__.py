@@ -2,25 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-ETL Package cho JobInsight Data Warehouse
+ETL package cho việc chuyển dữ liệu từ Staging sang Data Warehouse
 """
 
-from .etl_runner import run_staging_to_dwh_etl, main
-from .etl_base import get_duckdb_connection, setup_duckdb_schema, get_staging_batch
-from .etl_dimensions import process_all_dimensions
-from .etl_facts import process_facts_and_bridge
-from .etl_cleanup import cleanup_duplicate_fact_records, validate_data_quality
+# Import các module chính
+from src.etl.etl_main import run_staging_to_dwh_etl, get_staging_batch, verify_etl_integrity
+from src.etl.etl_utils import get_duckdb_connection, setup_duckdb_schema
+from src.etl.dimension_handler import DimensionHandler
+from src.etl.fact_handler import FactHandler
+from src.etl.partitioning import PartitionManager
 
 __all__ = [
     'run_staging_to_dwh_etl',
-    'main',
     'get_duckdb_connection',
-    'setup_duckdb_schema', 
+    'setup_duckdb_schema',
     'get_staging_batch',
-    'process_all_dimensions',
-    'process_facts_and_bridge',
-    'cleanup_duplicate_fact_records',
-    'validate_data_quality'
+    'verify_etl_integrity',
+    'DimensionHandler',
+    'FactHandler',
+    'PartitionManager'
 ]
 
 __version__ = "1.0.0"

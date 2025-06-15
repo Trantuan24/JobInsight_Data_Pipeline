@@ -5,14 +5,19 @@
 ETL module cho việc chuyển dữ liệu từ Staging sang Data Warehouse (DuckDB)
 Fixed version với logic parsing location mới
 """
-import pandas as pd
-import logging
+# Standard library imports
 import json
+import logging
 import os
 import sys
-import duckdb
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
+
+# Third-party imports
+import pandas as pd
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,24 +39,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from src.utils.logger import get_logger
+# Local imports
 from src.utils.db import get_connection, get_dataframe, execute_query
 from src.utils.config import DUCKDB_PATH, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE
-
-try:
-    from src.processing.data_prepare import (
-        prepare_dim_job, prepare_dim_company, prepare_dim_location, 
-        generate_date_range, parse_single_location_item, parse_job_location,
-        check_dimension_changes, apply_scd_type2_updates, 
-        generate_daily_fact_records, calculate_load_month
-    )
-except ImportError:
-    from processing.data_prepare import (
-        prepare_dim_job, prepare_dim_company, prepare_dim_location, 
-        generate_date_range, parse_single_location_item, parse_job_location,
-        check_dimension_changes, apply_scd_type2_updates, 
-        generate_daily_fact_records, calculate_load_month
-    )
+from src.processing.data_prepare import (
+    prepare_dim_job, prepare_dim_company, prepare_dim_location, 
+    generate_date_range, parse_single_location_item, parse_job_location,
+    check_dimension_changes, apply_scd_type2_updates, 
+    generate_daily_fact_records, calculate_load_month
+)
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
@@ -441,6 +437,17 @@ def generate_fact_records(
     fact_records = []
     bridge_records = []
     
+    # Thống kê job_ids để log
+    job_ids = set()
+    date_counts = {}
+    skipped_jobs = 0
+    
+    # Chuẩn bị lookup cho Unknown location
+    unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
+    
+    # Tạo cache cho location lookups để tránh truy vấn lặp lại
+    location_cache = {}
+    
     for _, job in staging_records.iterrows():
         # Lookup dimension keys
         job_sk = lookup_dimension_key(
@@ -455,6 +462,7 @@ def generate_fact_records(
         # Check if required keys exist
         if not job_sk or not company_sk:
             logger.warning(f"Bỏ qua job_id={job.job_id}: Không tìm thấy dimension key (job_sk={job_sk}, company_sk={company_sk})")
+            skipped_jobs += 1
             continue
         
         # Xử lý ngày
@@ -468,6 +476,51 @@ def generate_fact_records(
         # Tính load_month
         load_month = calculate_load_month(crawled_at)
         
+        # Thống kê để log
+        job_ids.add(job.job_id)
+        date_counts[job.job_id] = len(daily_dates)
+        
+        # Parse location string - Di chuyển ra ngoài vòng lặp ngày
+        location_str = None
+        if 'location_pairs' in job and pd.notna(job.location_pairs):
+            location_str = str(job.location_pairs)
+        elif 'location' in job and pd.notna(job.location):
+            location_str = str(job.location)
+            
+        # Parse location thành các tuple (province, city, district)
+        parsed_locations = parse_job_location(location_str) if location_str else []
+        
+        # Tìm location_sk cho tất cả locations của job này trước
+        location_sks = set()
+        if parsed_locations:
+            for province, city, district in parsed_locations:
+                # Tạo cache key
+                cache_key = f"{province}:{city}:{district}"
+                
+                if cache_key in location_cache:
+                    location_sk = location_cache[cache_key]
+                else:
+                    # Thử lookup với đầy đủ thông tin trước
+                    location_sk = lookup_location_key(duck_conn, province, city, district)
+                    
+                    if not location_sk and city:
+                        # Thử với chỉ province + city
+                        location_sk = lookup_location_key(duck_conn, province, city, None)
+                        
+                    if not location_sk and city:
+                        # Thử với chỉ city
+                        location_sk = lookup_location_key(duck_conn, None, city, None)
+                    
+                    # Lưu vào cache
+                    location_cache[cache_key] = location_sk
+                
+                if location_sk:
+                    location_sks.add(location_sk)
+        
+        # Nếu không tìm được location nào, dùng Unknown
+        if not location_sks and unknown_location_sk:
+            location_sks.add(unknown_location_sk)
+        
         # Tạo fact records cho từng ngày
         for date_id in daily_dates:
             try:
@@ -478,28 +531,40 @@ def generate_fact_records(
                 """
                 existing_fact = duck_conn.execute(check_query, [job_sk, date_id]).fetchone()
                 
+                # Chuẩn bị common values cho cả insert và update
+                common_values = {
+                    'job_sk': job_sk,
+                    'company_sk': company_sk,
+                    'date_id': date_id,
+                    'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
+                    'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
+                    'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
+                    'due_date': due_date,
+                    'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
+                    'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
+                    'posted_time': posted_time,
+                    'crawled_at': crawled_at,
+                    'load_month': load_month
+                }
+                
+                fact_id = None
                 if existing_fact:
-                    # Đã tồn tại, chỉ cập nhật một số field quan trọng
+                    # Đã tồn tại, cập nhật
                     fact_id = existing_fact[0]
                     
-                    update_query = """
+                    # Lọc ra các giá trị không null để update
+                    non_null_items = {k: v for k, v in common_values.items() if v is not None}
+                    set_clauses = [f"{k} = ?" for k in non_null_items.keys()]
+                    values = list(non_null_items.values()) + [fact_id]
+                    
+                    update_query = f"""
                         UPDATE FactJobPostingDaily 
-                        SET 
-                            time_remaining = ?,
-                            crawled_at = ?,
-                            load_month = ?
+                        SET {', '.join(set_clauses)}
                         WHERE fact_id = ?
                     """
                     
-                    update_values = [
-                        job.time_remaining if pd.notna(job.time_remaining) else None,
-                        crawled_at,
-                        load_month,
-                        fact_id
-                    ]
-                    
                     try:
-                        duck_conn.execute(update_query, update_values)
+                        duck_conn.execute(update_query, values)
                         logger.debug(f"Updated existing fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
                     except Exception as e:
                         logger.error(f"Lỗi khi update fact record cho job_id={job.job_id}, date={date_id}: {e}")
@@ -507,25 +572,11 @@ def generate_fact_records(
                         
                 else:
                     # Chưa tồn tại, tạo mới
-                    fact_record = {
-                        'job_sk': job_sk,
-                        'company_sk': company_sk,
-                        'date_id': date_id,
-                        'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
-                        'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
-                        'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
-                        'due_date': due_date,
-                        'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
-                        'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
-                        'posted_time': posted_time,
-                        'crawled_at': crawled_at,
-                        'load_month': load_month
-                    }
-                
-                    # Insert fact record và lấy fact_id
-                    columns = ', '.join([k for k, v in fact_record.items() if v is not None])
-                    placeholders = ', '.join(['?'] * len([v for v in fact_record.values() if v is not None]))
-                    values = [v for v in fact_record.values() if v is not None]
+                    # Lọc ra các giá trị không null để insert
+                    non_null_items = {k: v for k, v in common_values.items() if v is not None}
+                    columns = ', '.join(non_null_items.keys())
+                    placeholders = ', '.join(['?'] * len(non_null_items))
+                    values = list(non_null_items.values())
                     
                     insert_query = f"""
                         INSERT INTO FactJobPostingDaily ({columns})
@@ -540,69 +591,34 @@ def generate_fact_records(
                             continue
                             
                         fact_id = result[0]
-                        fact_records.append(fact_record)
+                        fact_records.append(common_values)
                         logger.debug(f"Inserted new fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
                     
                     except Exception as e:
                         logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}, date={date_id}: {e}")
                         continue
-                    
-                # Xử lý locations với cấu trúc mới (province, city, district)
-                location_str = None
                 
-                # Ưu tiên sử dụng location_pairs nếu có
-                if hasattr(job, 'location_pairs'):
-                    try:
-                        location_pairs_value = getattr(job, 'location_pairs')
-                        if location_pairs_value is not None and str(location_pairs_value).lower() not in ['nan', 'none', '']:
-                            location_str = str(location_pairs_value)
-                    except:
-                        pass
-                        
-                # Fallback về location nếu không có location_pairs
-                if not location_str and hasattr(job, 'location'):
-                    try:
-                        location_value = getattr(job, 'location')
-                        if location_value is not None and str(location_value).lower() not in ['nan', 'none', '']:
-                            location_str = str(location_value)
-                    except:
-                        pass
+                # Xóa bridge records cũ cho fact_id này
+                duck_conn.execute("DELETE FROM FactJobLocationBridge WHERE fact_id = ?", [fact_id])
                 
-                # Xóa bridge records cũ cho fact_id này (nếu update)
-                if existing_fact:
-                    duck_conn.execute("DELETE FROM FactJobLocationBridge WHERE fact_id = ?", [fact_id])
-                
-                if location_str:
-                    # Parse location string thành các tuple (province, city, district)
-                    logger.debug(f"Parsing location_str: {location_str}")
-                    parsed_locations = parse_job_location(location_str)
-                    logger.debug(f"Parsed locations: {parsed_locations}")
-                    
-                    location_sks_added = set()  # Tránh duplicate locations cho cùng 1 fact_id
-                    
-                    for province, city, district in parsed_locations:
-                        location_sk = lookup_location_key(duck_conn, province, city, district)
-                        
-                        if location_sk and location_sk not in location_sks_added:
-                            bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
-                            location_sks_added.add(location_sk)
-                        elif not location_sk:
-                            # Nếu không tìm thấy exact match, thử tìm Unknown
-                            unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
-                            if unknown_location_sk and unknown_location_sk not in location_sks_added:
-                                bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
-                                location_sks_added.add(unknown_location_sk)
-                            else:
-                                logger.warning(f"Không tìm thấy location_sk cho job_id={job.job_id}, location=({province}, {city}, {district})")
-                else:
-                    # Không có location, sử dụng Unknown
-                    unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
-                    if unknown_location_sk:
-                        bridge_records.append({'fact_id': fact_id, 'location_sk': unknown_location_sk})
+                # Tạo bridge records cho tất cả locations đã tìm thấy
+                for location_sk in location_sks:
+                    bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
                         
             except Exception as e:
-                logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}, date={date_id}: {e}")
+                logger.error(f"Lỗi khi xử lý fact record cho job_id={job.job_id}, date={date_id}: {e}", exc_info=True)
                 continue
+    
+    # Log kết quả
+    logger.info(f"Đã tạo {len(fact_records)} fact records cho {len(job_ids)} jobs")
+    logger.info(f"Đã tạo {len(bridge_records)} bridge records")
+    logger.info(f"Số jobs bị bỏ qua: {skipped_jobs}")
+    
+    # Log phân bố số fact records trên mỗi job
+    if date_counts:
+        avg_dates = sum(date_counts.values()) / len(date_counts)
+        max_dates = max(date_counts.values() if date_counts else [0])
+        logger.info(f"Trung bình {avg_dates:.1f} ngày/job, tối đa {max_dates} ngày/job")
     
     return fact_records, bridge_records
 
@@ -882,7 +898,7 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
             # Log load_month stats
             load_months = set()
             if fact_records:
-                load_months = set(record.get('load_month') for record in fact_records)
+                load_months = set(record.get('load_month') for record in fact_records if record.get('load_month'))
                 logger.info(f"Partition load_month: {', '.join(sorted(load_months))}")
             
             # 7. Validation và Data Quality Check
@@ -906,6 +922,36 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
                 validation_success = False
                 validation_message = f"Lỗi khi thực hiện validation: {str(e)}"
                 logger.error(validation_message)
+            
+            # 8. Export dữ liệu ra Parquet theo load_month
+            logger.info("📦 Bắt đầu export dữ liệu ra Parquet...")
+            export_success = False
+            export_message = ""
+            export_stats = {}
+            
+            try:
+                # Chuyển từ set sang list để export
+                load_months_list = list(load_months) if load_months else None
+                
+                # Chỉ export nếu có load_months mới
+                if load_months_list:
+                    export_results = export_to_parquet(duck_conn, load_months_list)
+                    export_success = export_results.get('success', False)
+                    export_stats = export_results
+                    
+                    if export_success:
+                        export_message = f"Đã export dữ liệu cho {len(load_months_list)} load_month"
+                        logger.info(f"✅ {export_message}")
+                    else:
+                        export_message = f"Có lỗi khi export dữ liệu: {export_results.get('message', 'Unknown error')}"
+                        logger.warning(f"⚠️ {export_message}")
+                else:
+                    export_message = "Không có load_month nào để export"
+                    logger.info(export_message)
+            except Exception as e:
+                export_success = False
+                export_message = f"Lỗi khi export dữ liệu ra Parquet: {str(e)}"
+                logger.error(export_message, exc_info=True)
         
         # Tính thời gian chạy
         duration = (datetime.now() - start_time).total_seconds()
@@ -927,7 +973,10 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
             "load_months": list(load_months),
             "duration_seconds": duration,
             "validation_success": validation_success,
-            "validation_message": validation_message
+            "validation_message": validation_message,
+            "export_success": export_success,
+            "export_message": export_message,
+            "export_stats": export_stats
         }
         
         return etl_stats
@@ -954,3 +1003,161 @@ if __name__ == "__main__":
     else:
         logger.error(f"❌ ETL THẤT BẠI: {etl_result.get('message', 'Unknown error')}")
         sys.exit(1)
+
+def export_to_parquet(duck_conn: duckdb.DuckDBPyConnection, load_months: List[str] = None) -> Dict[str, Any]:
+    """
+    Export dữ liệu từ DWH ra file Parquet theo load_month
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        load_months: List các load_month cần export, nếu None thì export tất cả
+        
+    Returns:
+        Thông tin về quá trình export
+    """
+    try:
+        # Tạo thư mục export nếu chưa có
+        export_dir = os.path.join(PROJECT_ROOT, "export", "dwh")
+        os.makedirs(export_dir, exist_ok=True)
+        
+        # Nếu không chỉ định load_months, lấy tất cả load_months từ fact table
+        if not load_months:
+            query = "SELECT DISTINCT load_month FROM FactJobPostingDaily ORDER BY load_month"
+            load_months_result = duck_conn.execute(query).fetchall()
+            load_months = [row[0] for row in load_months_result]
+        
+        if not load_months:
+            logger.warning("Không có load_month nào để export!")
+            return {"success": False, "message": "No load_months found"}
+        
+        # Thống kê
+        stats = {
+            "load_months": load_months,
+            "exports": {},
+            "success": True,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Chuẩn bị queries
+        queries = {
+            "facts": """
+                SELECT f.*, j.title_clean, j.job_id, c.company_name_standardized
+                FROM FactJobPostingDaily f
+                JOIN DimJob j ON f.job_sk = j.job_sk
+                JOIN DimCompany c ON f.company_sk = c.company_sk
+                WHERE f.load_month = '{}'
+            """,
+            "locations": """
+                SELECT f.fact_id, f.job_sk, f.date_id, j.job_id, j.title_clean,
+                       l.province, l.city, l.district
+                FROM FactJobPostingDaily f
+                JOIN DimJob j ON f.job_sk = j.job_sk
+                JOIN FactJobLocationBridge b ON f.fact_id = b.fact_id
+                JOIN DimLocation l ON b.location_sk = l.location_sk
+                WHERE f.load_month = '{}'
+            """,
+            "analytics": """
+                SELECT j.title_clean, j.job_id, c.company_name_standardized, 
+                       f.date_id, f.salary_min, f.salary_max, f.salary_type,
+                       f.due_date, f.posted_time, f.verified_employer
+                FROM FactJobPostingDaily f
+                JOIN DimJob j ON f.job_sk = j.job_sk
+                JOIN DimCompany c ON f.company_sk = c.company_sk
+                WHERE f.load_month = '{}'
+            """
+        }
+        
+        # Export dữ liệu cho mỗi load_month
+        total_records = 0
+        for load_month in load_months:
+            logger.info(f"Bắt đầu export dữ liệu cho load_month: {load_month}")
+            
+            # Tạo thư mục cho load_month
+            month_dir = os.path.join(export_dir, load_month)
+            os.makedirs(month_dir, exist_ok=True)
+            
+            try:
+                export_files = {}
+                record_counts = {}
+                month_total = 0
+                
+                # Export từng loại dữ liệu
+                for export_type, query_template in queries.items():
+                    query = query_template.format(load_month)
+                    df = duck_conn.execute(query).fetchdf()
+                    
+                    if not df.empty:
+                        file_name = f"job_{export_type}_{load_month}.parquet"
+                        file_path = os.path.join(month_dir, file_name)
+                        df.to_parquet(file_path, index=False)
+                        
+                        export_files[export_type] = file_name
+                        record_counts[export_type] = len(df)
+                        stats["exports"][f"{export_type}_{load_month}"] = len(df)
+                        month_total += len(df)
+                    else:
+                        export_files[export_type] = None
+                        record_counts[export_type] = 0
+                        stats["exports"][f"{export_type}_{load_month}"] = 0
+                
+                # Export metadata file
+                meta_data = {
+                    "load_month": load_month,
+                    "export_time": datetime.now().isoformat(),
+                    "record_counts": record_counts,
+                    "files": [f for f in export_files.values() if f]
+                }
+                
+                meta_file = os.path.join(month_dir, f"metadata_{load_month}.json")
+                with open(meta_file, 'w', encoding='utf-8') as f:
+                    json.dump(meta_data, f, indent=2)
+                
+                # Log tổng hợp
+                logger.info(f"✅ Đã export {month_total} records cho load_month {load_month}")
+                total_records += month_total
+                
+            except Exception as e:
+                error_msg = f"Lỗi khi export dữ liệu cho load_month {load_month}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                stats["exports"][f"error_{load_month}"] = error_msg
+                stats["success"] = False
+        
+        # Tạo file index cho tất cả load_months
+        try:
+            index_data = {
+                "load_months": load_months,
+                "export_time": datetime.now().isoformat(),
+                "export_count": len(load_months),
+                "total_records": total_records
+            }
+            
+            index_file = os.path.join(export_dir, "index.json")
+            with open(index_file, 'w', encoding='utf-8') as f:
+                json.dump(index_data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Lỗi khi tạo index file: {str(e)}")
+        
+        # Log tổng kết
+        logger.info(f"✅ Hoàn thành export {total_records} records cho {len(load_months)} load_months")
+        stats["total_records"] = total_records
+        
+        return stats
+    
+    except Exception as e:
+        logger.error(f"Lỗi khi export dữ liệu ra Parquet: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+def run_etl(last_etl_date: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Alias của run_staging_to_dwh_etl để đảm bảo tính nhất quán giữa các module
+    
+    Args:
+        last_etl_date: Timestamp của lần ETL gần nhất, mặc định là 7 ngày trước
+        
+    Returns:
+        Dict[str, Any]: Kết quả thống kê ETL
+    """
+    return run_staging_to_dwh_etl(last_etl_date)
