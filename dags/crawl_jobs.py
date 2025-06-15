@@ -3,17 +3,19 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.dummy import DummyOperator
 import logging
-
-print("LOADING CRAWL_JOBS DAG!")
-logging.info("LOADING CRAWL_JOBS DAG!")
 import sys
 import os
+import json
 
-# Thêm đường dẫn để import các modules từ src
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)) + "/..")
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Import các modules cần thiết
-from src.crawler.crawler import crawl_jobs
+# Add project path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# Import modules
+from src.crawler.crawler import backup_html_pages, parse_html_files
 from src.ingestion.ingest import ingest_dataframe
 
 default_args = {
@@ -21,116 +23,126 @@ default_args = {
     'depends_on_past': False,
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 2,  # Tăng số lần retry
+    'retry_delay': timedelta(minutes=2),  # Giảm thời gian chờ retry
 }
+
+def backup_html_task(**kwargs):
+    """Task 1: Backup HTML pages từ TopCV"""
+    import asyncio
+    
+    logger.info("Starting HTML backup task")
+    results = asyncio.run(backup_html_pages(num_pages=5))
+    
+    # Count successful backups
+    successful = sum(1 for r in results if r.get("success", False))
+    total = len(results)
+    
+    logger.info(f"Backup completed: {successful}/{total} pages successful")
+    
+    if successful == 0:
+        raise Exception("Failed to backup any HTML pages")
+    
+    # Save to XCom for monitoring
+    return {
+        "total": total,
+        "successful": successful,
+        "failed": total - successful,
+        "timestamp": datetime.now().isoformat(),
+        "filenames": [r.get("filename") for r in results if r.get("success", False)] 
+    }
+
+def parse_and_save_task(**kwargs):
+    """Task 2: Parse HTML files và lưu vào database"""
+    logger.info("Starting parse and save task")
+    
+    # Get previous task result from XCom
+    ti = kwargs['ti']
+    backup_result = ti.xcom_pull(task_ids='backup_html')
+    if backup_result:
+        logger.info(f"Processing {backup_result['successful']} HTML files")
+    
+    # Parse HTML files
+    df = parse_html_files()
+    
+    if df.empty:
+        logger.warning("No data parsed from HTML files")
+        return {
+            "status": "no_data",
+            "message": "No data to ingest",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    logger.info(f"Parsed {len(df)} jobs from HTML files")
+    
+    # Ensure job_id is string type
+    if 'job_id' in df.columns:
+        df['job_id'] = df['job_id'].astype(str)
+        
+    # Log thông tin về skills để phân tích
+    if 'skills' in df.columns:
+        all_skills = []
+        for skills_list in df['skills']:
+            if isinstance(skills_list, list):
+                all_skills.extend(skills_list)
+        
+        # Top 10 skills phổ biến nhất
+        from collections import Counter
+        top_skills = Counter(all_skills).most_common(10)
+        logger.info(f"Top 10 skills trong data crawled: {json.dumps(top_skills)}")
+    
+    # Ingest to database
+    try:
+        result = ingest_dataframe(df)
+        
+        logger.info(f"Ingestion completed: {result['inserted']} inserted, {result['updated']} updated")
+        
+        result_data = {
+            "status": "success",
+            "total_processed": len(df),
+            "inserted": result['inserted'],
+            "updated": result['updated'],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Thêm thông tin về công ty và lĩnh vực
+        if 'company_name' in df.columns:
+            result_data['companies'] = df['company_name'].nunique()
+        
+        if 'location' in df.columns:
+            result_data['locations'] = df['location'].nunique()
+            
+        return result_data
+        
+    except Exception as e:
+        logger.error(f"Error during ingestion: {str(e)}")
+        raise
 
 with DAG(
     'crawl_topcv_jobs',
     default_args=default_args,
     description='Crawl job data from TopCV and ingest to database',
-    schedule_interval='0 11 * * *',  # Chạy 9 giờ sáng mỗi ngày
+    schedule_interval='0 12 * * *',  # Run at 12:00 AM daily
     start_date=datetime(2023, 10, 1),
     catchup=False,
-    tags=['jobinsight', 'crawler'],
+    tags=['jobinsight', 'crawler', 'etl'],
 ) as dag:
 
-    start = DummyOperator(
-        task_id='start',
-    )
-
-    # Đường dẫn tạm thời để lưu DataFrame
-    temp_file_path = "/opt/airflow/data/temp_crawled_data.csv"
+    start = DummyOperator(task_id='start')
     
-    # Task crawl dữ liệu từ TopCV và lưu vào file
-    def crawl_and_save(**kwargs):
-        # Crawl 5 trang từ BASE_URL, không sử dụng keywords nữa
-        df = crawl_jobs(num_pages=5)
-        if not df.empty:
-            # Tạo thư mục nếu chưa tồn tại
-            import os
-            os.makedirs(os.path.dirname(temp_file_path), exist_ok=True)
-            
-            # Chuyển đổi các trường JSON về dạng string an toàn
-            import json
-            if 'skills' in df.columns:
-                # Chuyển đổi skills từ cấu trúc dữ liệu thành JSON string đúng định dạng
-                df['skills'] = df['skills'].apply(lambda x: json.dumps(x) if x is not None else None)
-            
-            # Lưu DataFrame vào file CSV
-            df.to_csv(temp_file_path, index=False)
-            return temp_file_path
-        return None
-    
-    crawl_task = PythonOperator(
-        task_id='crawl_topcv_data',
-        python_callable=crawl_and_save,
+    backup_html = PythonOperator(
+        task_id='backup_html',
+        python_callable=backup_html_task,
+        provide_context=True,
     )
     
-    # Task đọc file CSV và ingest vào database
-    def load_and_ingest(**kwargs):
-        import pandas as pd
-        import os
-        import json
-        
-        if os.path.exists(temp_file_path):
-            df = pd.read_csv(temp_file_path)
-            
-            # Chuyển đổi job_id thành chuỗi
-            if 'job_id' in df.columns:
-                df['job_id'] = df['job_id'].astype(str)
-                print(f"Đã chuyển đổi job_id sang kiểu chuỗi: {df['job_id'].head()}")
-            
-            # Chuyển đổi trường skills từ string JSON thành cấu trúc dữ liệu Python
-            if 'skills' in df.columns:
-                def parse_json_safely(value):
-                    if pd.isna(value) or value is None or value == '':
-                        return None
-                    try:
-                        return json.loads(value)
-                    except:
-                        return None
-                
-                df['skills'] = df['skills'].apply(parse_json_safely)
-                print(f"Đã chuyển đổi skills sang JSON: {str(df['skills'].head())}")
-            
-            # Đảm bảo posted_time không bị null
-            if 'posted_time' in df.columns:
-                # Đếm số giá trị null
-                null_count = df['posted_time'].isnull().sum()
-                if null_count > 0:
-                    print(f"Cảnh báo: {null_count} bản ghi có posted_time là NULL")
-                    # Kiểm tra xem có cột last_update không để tính posted_time
-                    if 'last_update' in df.columns:
-                        from datetime import datetime
-                        from src.crawler.data_extractor import parse_last_update
-                        
-                        # Chỉ điền posted_time cho các bản ghi NULL
-                        for idx, row in df[df['posted_time'].isnull()].iterrows():
-                            if pd.notna(row['last_update']):
-                                try:
-                                    seconds_ago = parse_last_update(row['last_update'])
-                                    posted_time = datetime.now().timestamp() - seconds_ago
-                                    df.at[idx, 'posted_time'] = datetime.fromtimestamp(posted_time).isoformat()
-                                except:
-                                    print(f"Không thể tính posted_time cho job_id: {row['job_id']}")
-                
-                # In thông tin về posted_time
-                print(f"Kiểm tra posted_time sau xử lý: {df['posted_time'].head()}")
-            
-            ingest_dataframe(df)
-            # Xóa file tạm sau khi ingest
-            os.remove(temp_file_path)
-            return f"Ingested {len(df)} records"
-        return "No data to ingest"
-        
-    ingest_task = PythonOperator(
-        task_id='ingest_job_data',
-        python_callable=load_and_ingest,
+    parse_and_save = PythonOperator(
+        task_id='parse_and_save',
+        python_callable=parse_and_save_task,
+        provide_context=True,
     )
 
-    end = DummyOperator(
-        task_id='end',
-    )
+    end = DummyOperator(task_id='end')
 
-    start >> crawl_task >> ingest_task >> end 
+    # Define task dependencies
+    start >> backup_html >> parse_and_save >> end 
