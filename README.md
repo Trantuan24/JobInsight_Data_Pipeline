@@ -47,4 +47,3 @@ Run the test suite to verify the pipeline's functionality:
 ```bash
 pytest tests/
 ```
-
