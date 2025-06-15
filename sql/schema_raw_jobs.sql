@@ -14,8 +14,7 @@ CREATE TABLE IF NOT EXISTS raw_jobs (
     last_update VARCHAR(100),
     logo_url TEXT,
     posted_time TIMESTAMP WITH TIME ZONE,
-    crawled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    raw_data JSONB
+    crawled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Index để tăng tốc truy vấn
