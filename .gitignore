@@ -39,14 +39,21 @@ unittests.cfg
 .airflowignore
 logs/
 airflow_home/
+airflow-webserver.pid
+standalone_admin_password.txt
+
+# Backup HTML files
+raw_backup/
 
 # Data & Results
-data/raw/
+data/
+results/
 *.csv
+*.json
 *.parquet
-*.db
-*.sqlite3
-*.duckdb
+
+# CDC files
+data/cdc/
 
 # Logs
 *.log
