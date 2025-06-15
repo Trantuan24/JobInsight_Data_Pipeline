@@ -55,6 +55,7 @@ results/
 *.json
 *.parquet
 *.db
+*.duckdb
 
 # Ẩn nội dung trong thư mục cdc nhưng giữ cấu trúc
 data/cdc/**/*.jsonl
@@ -62,6 +63,7 @@ data/cdc/**/*.jsonl
 # Ẩn nội dung trong thư mục duck_db nhưng giữ cấu trúc
 data/duck_db/**/*.db
 data/duck_db/**/*.wal
+data/duck_db/**/*.duckdb
 
 # Ẩn nội dung trong thư mục parquet nhưng giữ cấu trúc
 data/parquet/**/*.parquet
