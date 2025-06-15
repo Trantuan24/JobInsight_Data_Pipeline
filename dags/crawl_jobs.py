@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # Import modules
 from src.crawler.crawler import backup_html_pages, parse_html_files
 from src.ingestion.ingest import ingest_dataframe
+from src.ingestion.cdc import cleanup_old_cdc_files
 
 default_args = {
     'owner': 'airflow',
@@ -118,11 +119,37 @@ def parse_and_save_task(**kwargs):
         logger.error(f"Error during ingestion: {str(e)}")
         raise
 
+def cdc_cleanup_task(days_to_keep=15, **kwargs):
+    """
+    Xóa các file CDC cũ hơn số ngày chỉ định
+    
+    Args:
+        days_to_keep: Số ngày dữ liệu CDC cần giữ lại, mặc định là 15 ngày
+    """
+    logger.info(f"Bắt đầu dọn dẹp dữ liệu CDC cũ hơn {days_to_keep} ngày")
+    
+    try:
+        # Gọi hàm cleanup từ module cdc
+        stats = cleanup_old_cdc_files(days_to_keep)
+        
+        # Ghi log kết quả
+        logger.info(f"Kết quả dọn dẹp CDC:")
+        logger.info(f"- Thư mục đã xóa: {stats['dirs_removed']}")
+        logger.info(f"- File đã xóa: {stats['files_removed']}")
+        logger.info(f"- Dung lượng giải phóng: {stats['bytes_freed'] / (1024*1024):.2f} MB")
+        logger.info(f"- Lỗi: {stats['errors']}")
+        
+        # Trả về kết quả cho XCom
+        return stats
+    except Exception as e:
+        logger.error(f"Lỗi khi dọn dẹp CDC: {str(e)}")
+        raise e
+
 with DAG(
     'crawl_topcv_jobs',
     default_args=default_args,
     description='Crawl job data from TopCV and ingest to database',
-    schedule_interval='0 12 * * *',  # Run at 12:00 AM daily
+    schedule_interval='0 11 * * *',  # Run at 11:00 AM daily
     start_date=datetime(2023, 10, 1),
     catchup=False,
     tags=['jobinsight', 'crawler', 'etl'],
@@ -141,8 +168,16 @@ with DAG(
         python_callable=parse_and_save_task,
         provide_context=True,
     )
+    
+    # Task dọn dẹp CDC
+    cleanup_cdc = PythonOperator(
+        task_id='cleanup_cdc',
+        python_callable=cdc_cleanup_task,
+        op_kwargs={'days_to_keep': 15},  # Giữ 15 ngày dữ liệu CDC
+        provide_context=True,
+    )
 
     end = DummyOperator(task_id='end')
 
     # Define task dependencies
-    start >> backup_html >> parse_and_save >> end 
+    start >> backup_html >> parse_and_save >> cleanup_cdc >> end 
