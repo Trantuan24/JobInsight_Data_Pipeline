@@ -14,6 +14,8 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '10'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    # Thêm cấu hình múi giờ Việt Nam
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: 'Asia/Ho_Chi_Minh'
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
