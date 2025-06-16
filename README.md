@@ -1,3 +1,4 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Trantuan24/JobInsight_Data_Pipeline)
 # JobInsight Data Pipeline
 
 ## Description
