@@ -75,7 +75,6 @@ erDiagram
     DimDate ||--o{ FactJobPostingDaily : on
     FactJobPostingDaily ||--o{ FactJobLocationBridge : contains
     DimLocation ||--o{ FactJobLocationBridge : categorises
-}
 ```
 
 ## Dimension Details
