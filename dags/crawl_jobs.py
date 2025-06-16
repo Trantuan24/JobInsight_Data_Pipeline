@@ -149,7 +149,7 @@ with DAG(
     'crawl_topcv_jobs',
     default_args=default_args,
     description='Crawl job data from TopCV and ingest to database',
-    schedule_interval='0 11 * * *',  # Run at 11:00 AM daily
+    schedule_interval='0 5 * * *',  # Run at 5:00 AM Vietnam time (Asia/Ho_Chi_Minh)
     start_date=datetime(2023, 10, 1),
     catchup=False,
     tags=['jobinsight', 'crawler', 'etl'],
