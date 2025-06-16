@@ -18,56 +18,56 @@ This document describes the relational schemas that underpin the JobInsight Data
 ```mermaid
 erDiagram
     DimJob {
-        INTEGER job_sk PK
-        VARCHAR job_id UNIQUE
-        VARCHAR title_clean
-        TEXT job_url
-        JSON skills
-        DATE effective_date
-        DATE expiry_date
-        BOOLEAN is_current
+        job_sk INTEGER PK
+        job_id VARCHAR UNIQUE
+        title_clean VARCHAR
+        job_url TEXT
+        skills JSON
+        effective_date DATE
+        expiry_date DATE
+        is_current BOOLEAN
     }
     DimCompany {
-        INTEGER company_sk PK
-        VARCHAR company_name_standardized
-        TEXT company_url
-        BOOLEAN verified_employer
-        DATE effective_date
-        DATE expiry_date
-        BOOLEAN is_current
+        company_sk INTEGER PK
+        company_name_standardized VARCHAR
+        company_url TEXT
+        verified_employer BOOLEAN
+        effective_date DATE
+        expiry_date DATE
+        is_current BOOLEAN
     }
     DimLocation {
-        INTEGER location_sk PK
-        VARCHAR province
-        VARCHAR city
-        VARCHAR district
-        DATE effective_date
-        DATE expiry_date
-        BOOLEAN is_current
+        location_sk INTEGER PK
+        province VARCHAR
+        city VARCHAR
+        district VARCHAR
+        effective_date DATE
+        expiry_date DATE
+        is_current BOOLEAN
     }
     DimDate {
-        DATE date_id PK
-        INTEGER day
-        INTEGER month
-        INTEGER quarter
-        INTEGER year
-        VARCHAR weekday
+        date_id DATE PK
+        day INTEGER
+        month INTEGER
+        quarter INTEGER
+        year INTEGER
+        weekday VARCHAR
     }
     FactJobPostingDaily {
-        INTEGER fact_id PK
-        INTEGER job_sk FK
-        INTEGER company_sk FK
-        DATE date_id FK
-        NUMERIC salary_min
-        NUMERIC salary_max
-        VARCHAR salary_type
-        TIMESTAMP due_date
-        TIMESTAMP posted_time
-        VARCHAR load_month
+        fact_id INTEGER PK
+        job_sk INTEGER FK
+        company_sk INTEGER FK
+        date_id DATE FK
+        salary_min NUMERIC
+        salary_max NUMERIC
+        salary_type VARCHAR
+        due_date TIMESTAMP
+        posted_time TIMESTAMP
+        load_month VARCHAR
     }
     FactJobLocationBridge {
-        INTEGER fact_id FK
-        INTEGER location_sk FK
+        fact_id INTEGER FK
+        location_sk INTEGER FK
     }
 
     DimJob ||--o{ FactJobPostingDaily : "has"
@@ -75,6 +75,7 @@ erDiagram
     DimDate ||--o{ FactJobPostingDaily : "on"
     FactJobPostingDaily ||--o{ FactJobLocationBridge : "contains"
     DimLocation ||--o{ FactJobLocationBridge : "categorises"
+}
 ```
 
 ## Dimension Details
