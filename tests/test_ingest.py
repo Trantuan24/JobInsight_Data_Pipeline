@@ -24,6 +24,9 @@ from src.ingestion.ingest import (
     run_crawler
 )
 
+# Cập nhật để import crawler module đúng
+from src.crawler.crawler import crawl_jobs
+
 # Custom JSON encoder for datetime objects
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -202,7 +205,7 @@ class TestIngest(unittest.TestCase):
         mock_path_exists.assert_called_once()  # SQL file existence was checked
         mock_execute_sql.assert_called_once()  # SQL file was executed
     
-    @patch('src.crawler.crawler.crawl_multiple_keywords')
+    @patch('src.crawler.crawler.crawl_jobs')
     def test_run_crawler(self, mock_crawl):
         """Test running the crawler"""
         # Mock the crawler to return a DataFrame
@@ -213,11 +216,11 @@ class TestIngest(unittest.TestCase):
         mock_crawl.return_value = mock_df
         
         # Call the function
-        result = run_crawler(num_pages=2, keywords=['python'])
+        result = run_crawler(num_pages=2)
         
         # Assertions
         self.assertIs(result, mock_df)  # Result should be the mocked DataFrame
-        mock_crawl.assert_called_once_with(num_pages=2, keywords=['python'])  # Crawler was called with the right args
+        mock_crawl.assert_called_once_with(num_pages=2)  # Crawler was called with the right args
 
 if __name__ == '__main__':
     unittest.main() 

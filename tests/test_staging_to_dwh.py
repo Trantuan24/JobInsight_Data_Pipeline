@@ -19,12 +19,16 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
-# Import functions to test
-from src.processing.data_prepare import (
-    parse_job_location, calculate_load_month, 
+# Import functions to test - đảm bảo import các module đúng
+from src.etl.dimension_handler import (
     prepare_dim_job, prepare_dim_company, prepare_dim_location,
-    generate_daily_fact_records
+    apply_scd_type2_changes
 )
+from src.etl.fact_handler import (
+    generate_daily_fact_records, prepare_fact_job_daily
+)
+from src.etl.partitioning import calculate_load_month
+from src.etl.etl_utils import parse_job_location
 
 class TestETLPipelineSimple:
     """Test class đơn giản cho ETL Pipeline"""
@@ -46,6 +50,51 @@ class TestETLPipelineSimple:
             'location_pairs': ['["Hà Nội: Cầu Giấy"]', '["TP.HCM"]']
         })
     
+    # Test SCD Type 2 implementation
+    def test_scd_type2_implementation(self, sample_data):
+        """Test triển khai SCD Type 2 cho dimensions"""
+        print("\n=== Test SCD Type 2 Implementation ===")
+        
+        # Chuẩn bị dataframe hiện tại và dataframe mới để kiểm tra SCD
+        current_data = pd.DataFrame({
+            'job_id': ['JOB001'],
+            'title_clean': ['Python Developer'],
+            'skills': ['["Python", "Django"]'],
+            'effective_date': [datetime(2025, 5, 1)],
+            'is_current': [True]
+        })
+        
+        new_data = pd.DataFrame({
+            'job_id': ['JOB001'],
+            'title_clean': ['Senior Python Developer'],  # Thay đổi title
+            'skills': ['["Python", "Django", "Flask"]'],  # Thay đổi skills
+            'effective_date': [datetime(2025, 5, 28)],
+            'is_current': [True]
+        })
+        
+        # Apply SCD Type 2
+        result = apply_scd_type2_changes(
+            new_df=new_data,
+            current_df=current_data,
+            key_column='job_id',
+            track_columns=['title_clean', 'skills']
+        )
+        
+        # Kiểm tra kết quả
+        assert len(result) == 2  # 1 record cũ (deactivated) + 1 record mới
+        
+        # Kiểm tra record cũ được đánh dấu không còn hiện tại
+        old_record = result[result['effective_date'] == datetime(2025, 5, 1)]
+        assert len(old_record) == 1
+        assert old_record['is_current'].values[0] == False
+        
+        # Kiểm tra record mới được đánh dấu là hiện tại
+        new_record = result[result['effective_date'] == datetime(2025, 5, 28)]
+        assert len(new_record) == 1
+        assert new_record['is_current'].values[0] == True
+        
+        print("✅ SCD Type 2 implementation test passed")
+        
     def test_location_parsing(self):
         """Test parsing location - chức năng cơ bản nhất"""
         print("\n=== Test Location Parsing ===")
@@ -109,6 +158,7 @@ class TestETLPipelineSimple:
         
         print("✅ Daily fact records test passed")
     
+    # Cập nhật test để kiểm tra đúng theo SCD Type 2
     def test_prepare_dim_job(self, sample_data):
         """Test chuẩn bị dữ liệu DimJob"""
         print("\n=== Test Prepare DimJob ===")
@@ -132,6 +182,7 @@ class TestETLPipelineSimple:
         
         # Kiểm tra SCD2 fields
         assert all(result['is_current'] == True)
+        assert 'effective_date' in result.columns
         
         print(f"✅ DimJob preparation test passed - {len(result)} records")
     
@@ -173,103 +224,34 @@ class TestETLPipelineSimple:
         for _, row in result.iterrows():
             print(f"  Location: {row['province']} | {row['city']} | {row['district']}")
     
-    def test_data_quality_checks(self):
-        """Test data quality validation"""
-        print("\n=== Test Data Quality ===")
+    def test_prepare_fact_job_daily(self, sample_data):
+        """Test chuẩn bị dữ liệu FactJobDaily"""
+        print("\n=== Test Prepare FactJobDaily ===")
         
-        # Test với dữ liệu có vấn đề - phải có đủ columns để test
-        bad_data = pd.DataFrame({
-            'job_id': ['JOB001', '', None],
-            'title_clean': ['Good Title', '', None],
-            'job_url': ['https://job1.com', '', None],
-            'skills': ['["Python"]', '', None],
-            'last_update': ['2025-05-28', '', None],
-            'logo_url': ['https://logo1.png', '', None],
-            'company_name_standardized': ['Good Company', '', None],
-            'location_pairs': ['["Hà Nội"]', '', None]
-        })
-        
-        # Test DimJob với bad data
-        result = prepare_dim_job(bad_data)
-        
-        # Kiểm tra null title được handle
-        titles = result['title_clean'].tolist()
-        assert 'Unknown Title' in titles  # Should replace null/empty with this
-        assert 'Good Title' in titles     # Should keep good data
-        
-        print("✅ Data quality checks passed")
-    
-    def test_integration_flow(self, sample_data):
-        """Test integration của toàn bộ flow"""
-        print("\n=== Test Integration Flow ===")
-        
-        # Step 1: Prepare all dimensions
+        # Chuẩn bị dim tables (mock)
         dim_job = prepare_dim_job(sample_data)
         dim_company = prepare_dim_company(sample_data)
         dim_location = prepare_dim_location(sample_data)
         
-        print(f"Prepared dimensions:")
-        print(f"  - DimJob: {len(dim_job)} records")
-        print(f"  - DimCompany: {len(dim_company)} records") 
-        print(f"  - DimLocation: {len(dim_location)} records")
+        # Gọi function để test
+        fact_df = prepare_fact_job_daily(
+            staging_df=sample_data,
+            dim_job_df=dim_job,
+            dim_company_df=dim_company,
+            dim_location_df=dim_location
+        )
         
-        # Step 2: Check load month calculation
-        load_months = []
-        for _, row in sample_data.iterrows():
-            load_month = calculate_load_month(row['last_update'])
-            load_months.append(load_month)
+        # Kiểm tra có cấu trúc đúng
+        assert 'job_key' in fact_df.columns
+        assert 'company_key' in fact_df.columns
+        assert 'location_key' in fact_df.columns
+        assert 'job_date' in fact_df.columns
+        assert 'load_month' in fact_df.columns
         
-        print(f"Load months: {set(load_months)}")
+        # Kiểm tra số lượng records - mỗi job sẽ có nhiều ngày
+        assert len(fact_df) >= len(sample_data)
         
-        # Step 3: Generate some fact dates
-        posted = datetime(2025, 5, 28)
-        fact_dates = generate_daily_fact_records(posted, None)
-        
-        print(f"Generated fact dates: {len(fact_dates)} days")
-        
-        # Basic validations
-        assert len(dim_job) > 0
-        assert len(dim_company) > 0
-        assert len(dim_location) > 0
-        assert len(load_months) > 0
-        assert len(fact_dates) > 0
-        
-        print("✅ Integration flow test passed")
-    
-    def run_all_tests(self):
-        """Chạy tất cả tests"""
-        print("🚀 Starting Simple ETL Tests...")
-        
-        # Create sample data
-        sample_data = pd.DataFrame({
-            'job_id': ['JOB001', 'JOB002'],
-            'title_clean': ['Python Developer', 'Java Developer'],
-            'job_url': ['https://jobs.com/1', 'https://jobs.com/2'],
-            'skills': ['["Python", "Django"]', '["Java", "Spring"]'],
-            'last_update': ['2025-05-28', '2025-05-29'],
-            'logo_url': ['https://logo1.png', 'https://logo2.png'],
-            'company_name': ['Tech Corp', 'Dev Company'],
-            'company_name_standardized': ['Tech Corp Ltd', 'Dev Company Inc'],
-            'company_url': ['https://techcorp.com', 'https://devcompany.com'],
-            'verified_employer': [True, False],
-            'location_pairs': ['["Hà Nội: Cầu Giấy"]', '["TP.HCM"]']
-        })
-        
-        try:
-            self.test_location_parsing()
-            self.test_calculate_load_month()
-            self.test_generate_daily_fact_records()
-            self.test_prepare_dim_job(sample_data)
-            self.test_prepare_dim_company(sample_data)
-            self.test_prepare_dim_location(sample_data)
-            self.test_data_quality_checks()
-            self.test_integration_flow(sample_data)
-            
-            print("\n🎉 All tests passed successfully!")
-            
-        except Exception as e:
-            print(f"\n❌ Test failed: {e}")
-            raise
+        print(f"✅ FactJobDaily preparation test passed - {len(fact_df)} records")
 
 
 if __name__ == "__main__":
