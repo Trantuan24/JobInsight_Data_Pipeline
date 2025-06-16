@@ -1,8 +1,13 @@
-CREATE SEQUENCE IF NOT EXISTS seq_personid START 1;
+-- Tạo sequence riêng cho từng bảng với logic an toàn
+-- Các sequence này sẽ được reset lại bởi hàm reset_sequences trong etl_utils.py
+CREATE SEQUENCE IF NOT EXISTS seq_dim_job_sk START 10000;
+CREATE SEQUENCE IF NOT EXISTS seq_dim_company_sk START 10000;
+CREATE SEQUENCE IF NOT EXISTS seq_dim_location_sk START 10000;
+CREATE SEQUENCE IF NOT EXISTS seq_fact_id START 10000;
 
 -- PHẦN 1: TẠO BẢNG
 CREATE TABLE IF NOT EXISTS DimJob (
-    job_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
+    job_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_dim_job_sk'),
     job_id VARCHAR(20) NOT NULL UNIQUE,
     title_clean VARCHAR(255) NOT NULL,
     job_url TEXT,
@@ -15,7 +20,7 @@ CREATE TABLE IF NOT EXISTS DimJob (
 );
 
 CREATE TABLE IF NOT EXISTS DimCompany (
-    company_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
+    company_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_dim_company_sk'),
     company_name_standardized VARCHAR(200) NOT NULL,
     company_url TEXT,
     verified_employer BOOLEAN,
@@ -25,7 +30,7 @@ CREATE TABLE IF NOT EXISTS DimCompany (
 );
 
 CREATE TABLE IF NOT EXISTS DimLocation (
-    location_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
+    location_sk INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_dim_location_sk'),
     province VARCHAR(100),
     city VARCHAR(100) NOT NULL,
     district VARCHAR(100),
@@ -45,7 +50,7 @@ CREATE TABLE IF NOT EXISTS DimDate (
 
 -- Fact table với partition theo load_month và cập nhật đầy đủ
 CREATE TABLE IF NOT EXISTS FactJobPostingDaily (
-    fact_id INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_personid'),
+    fact_id INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_fact_id'),
     job_sk INTEGER NOT NULL,
     company_sk INTEGER NOT NULL,
     date_id DATE NOT NULL,
