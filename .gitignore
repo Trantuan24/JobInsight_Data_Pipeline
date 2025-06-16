@@ -1,9 +1,16 @@
-# Python
+### JobInsight ETL Pipeline .gitignore ###
+# Mục đích: Loại trừ các file không cần thiết khi đẩy code lên GitHub
+# Tổ chức: Phân loại theo nhóm và mục đích, giải thích rõ ràng
+
+### Python Files ###
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -20,7 +27,8 @@ wheels/
 .installed.cfg
 *.egg
 
-# Environments
+### Virtual Environment ###
+# Các thư mục môi trường ảo
 .env
 .venv
 env/
@@ -29,12 +37,13 @@ ENV/
 env.bak/
 venv.bak/
 
-# Jupyter Notebook
+### Jupyter Notebook ###
 .ipynb_checkpoints
 
-# Airflow
+### Airflow ###
+# File cấu hình và database Airflow
 airflow.db
-airflow.cfg
+# airflow.cfg - Không loại trừ file này nếu nó không chứa thông tin nhạy cảm
 unittests.cfg
 .airflowignore
 logs/
@@ -42,49 +51,88 @@ airflow_home/
 airflow-webserver.pid
 standalone_admin_password.txt
 
-# Backup HTML files
-raw_backup/
-
-# Data & Results - Giữ cấu trúc thư mục nhưng ẩn nội dung
-# Không ẩn toàn bộ thư mục data nữa
-# data/
-results/
-
-# Ẩn các file dữ liệu
+### Data Files ###
+# Loại trừ các loại file dữ liệu phổ biến
 *.csv
 *.json
+*.jsonl
 *.parquet
 *.db
 *.duckdb
+*.wal
 
-# Ẩn nội dung trong thư mục cdc nhưng giữ cấu trúc
-data/cdc/**/*.jsonl
+### Backup Files ###
+# File backup HTML từ quá trình crawling
+raw_backup/
 
-# Ẩn nội dung trong thư mục duck_db nhưng giữ cấu trúc
-data/duck_db/**/*.db
-data/duck_db/**/*.wal
-data/duck_db/**/*.duckdb
+### Data Directories ###
+# Chiến lược: Loại trừ nội dung nhưng giữ cấu trúc thư mục
+# CDC Data
+data/cdc/**/*
+!data/cdc/**/.gitkeep
 
-# Ẩn nội dung trong thư mục parquet nhưng giữ cấu trúc
-data/parquet/**/*.parquet
+# DuckDB Data
+data/duck_db/**/*
+!data/duck_db/**/.gitkeep
 
-# Logs
+# Parquet Data
+data/parquet/**/*
+!data/parquet/**/.gitkeep
+
+# Results data
+results/**/*
+!results/**/.gitkeep
+
+### Log Files ###
+# Loại trừ tất cả log files
 *.log
+logs/**/*
+!logs/**/.gitkeep
 
-# IDE
-.idea/
+### IDE Files ###
+# Visual Studio Code
 .vscode/
+*.code-workspace
+
+# PyCharm/IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
 *.swp
 *.swo
 
-# OS specific
+### OS Specific Files ###
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Windows
 Thumbs.db
+ehthumbs.db
+Desktop.ini
 
-# Docker
+### Docker ###
 .docker/
+docker-compose.override.yml
 
-# Testing
+### Testing Files ###
+# Unit test / coverage reports
 .coverage
 htmlcov/
 .pytest_cache/
+.tox/
+coverage.xml
+*.cover
+.hypothesis/
+
+### Local Configuration ###
+# Loại trừ file cấu hình cục bộ (có thể chứa thông tin nhạy cảm)
+# Nhưng giữ lại file ví dụ để hướng dẫn
+*.local.env
+# Giữ lại file env.example
+!env.example
