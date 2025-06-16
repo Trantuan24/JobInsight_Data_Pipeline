@@ -48,68 +48,117 @@ class FactHandler:
     
     def generate_fact_records(self, staging_records: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
         """
-        Tạo bản ghi fact và bridge từ dữ liệu staging với cơ chế ngăn chặn duplicate
+        Tạo fact records và bridge records từ staging data
         
         Args:
-            staging_records: Dữ liệu từ staging
-        
+            staging_records: DataFrame chứa các bản ghi từ staging
+            
         Returns:
-            Tuple chứa (fact_records, bridge_records)
+            Tuple[List[Dict], List[Dict]]: (fact_records, bridge_records)
         """
         fact_records = []
         bridge_records = []
         
-        for _, job in staging_records.iterrows():
-            try:
-                # Lookup dimension keys
-                job_sk = lookup_dimension_key(
-                    self.duck_conn, 'DimJob', 'job_id', job.job_id, 'job_sk'
-                )
+        # Lọc các bản ghi có đủ thông tin
+        if staging_records.empty:
+            logger.warning("Không có dữ liệu staging để xử lý!")
+            return [], []
+            
+        # Lấy thời gian hiện tại cho crawled_at và load_month
+        crawled_at = datetime.now()
+        load_month = crawled_at.strftime('%Y-%m')
+        
+        # Danh sách các ngày cần tạo fact record (hôm nay và vài ngày tới)
+        # Do jobs thường hiển thị trong nhiều ngày
+        today = datetime.now().date()
+        dates_to_create = [today + timedelta(days=i) for i in range(5)]  # Hôm nay và 4 ngày tiếp theo
+        
+        # Tạo một bản sao để tránh SettingWithCopyWarning
+        staging_df = staging_records.copy()
+        
+        # Đảm bảo các cột cần thiết tồn tại
+        for col in ['job_id', 'title_clean', 'company_name_standardized', 'due_date']:
+            if col not in staging_df.columns:
+                logger.error(f"Cột {col} không tồn tại trong dữ liệu staging!")
+                return [], []
                 
-                company_name = job.company_name_standardized if pd.notna(job.company_name_standardized) else job.company_name
-                company_sk = lookup_dimension_key(
-                    self.duck_conn, 'DimCompany', 'company_name_standardized', company_name, 'company_sk'
-                )
-                
-                # Check if required keys exist
-                if not job_sk or not company_sk:
-                    logger.warning(f"Bỏ qua job_id={job.job_id}: Không tìm thấy dimension key (job_sk={job_sk}, company_sk={company_sk})")
-                    continue
-                
-                # Xử lý ngày
-                due_date = pd.to_datetime(job.due_date) if pd.notna(job.due_date) else None
-                posted_time = pd.to_datetime(job.posted_time) if pd.notna(job.posted_time) else None
-                crawled_at = pd.to_datetime(job.crawled_at) if pd.notna(job.crawled_at) else datetime.now()
-                
-                # Tạo danh sách các ngày cần tạo fact records
-                daily_dates = generate_daily_fact_records(posted_time, due_date)
-                
-                # Tính load_month
-                load_month = calculate_load_month(crawled_at)
-                
-                # Tạo fact records cho từng ngày
-                for date_id in daily_dates:
-                    # Kiểm tra xem fact record đã tồn tại chưa
-                    fact_id = self._process_single_fact_record(
-                        job, job_sk, company_sk, date_id, due_date, posted_time, crawled_at, load_month
-                    )
-                    
-                    if fact_id:
-                        # Thêm fact_id vào danh sách fact_records
-                        fact_records.append({
-                            'fact_id': fact_id,
-                            'job_sk': job_sk,
-                            'date_id': date_id,
-                            'load_month': load_month
-                        })
-                        
-                        # Xử lý bridge records
-                        location_bridges = self._process_location_bridges(job, fact_id)
-                        bridge_records.extend(location_bridges)
-                
-            except Exception as e:
-                logger.error(f"Lỗi khi xử lý fact record cho job_id={job.job_id}: {e}")
+        # Xử lý từng bản ghi staging
+        job_skipped = 0
+        bridge_skipped = 0
+        
+        # Lấy toàn bộ DimJob current
+        dim_jobs = self.duck_conn.execute("""
+            SELECT job_id, job_sk FROM DimJob WHERE is_current = TRUE
+        """).fetchdf()
+        job_id_to_sk = dict(zip(dim_jobs['job_id'], dim_jobs['job_sk']))
+        
+        # Lấy toàn bộ DimCompany current
+        dim_companies = self.duck_conn.execute("""
+            SELECT company_name_standardized, company_sk FROM DimCompany WHERE is_current = TRUE
+        """).fetchdf()
+        company_to_sk = dict(zip(dim_companies['company_name_standardized'], dim_companies['company_sk']))
+        
+        # Tạo các fact records và bridge records
+        for _, job in staging_df.iterrows():
+            # Lấy surrogate keys
+            job_id = str(job['job_id'])
+            job_sk = job_id_to_sk.get(job_id)
+            
+            company_name = job['company_name_standardized']
+            company_sk = company_to_sk.get(company_name)
+            
+            # Kiểm tra xem job và company có tồn tại trong dimension tables không
+            if not job_sk:
+                logger.warning(f"Job ID {job_id} không tồn tại trong DimJob, bỏ qua...")
+                job_skipped += 1
                 continue
+                
+            if not company_sk:
+                logger.warning(f"Company {company_name} không tồn tại trong DimCompany, bỏ qua...")
+                job_skipped += 1
+                continue
+                
+            # Parse posted_time và due_date
+            posted_time = None
+            if hasattr(job, 'posted_time') and pd.notna(job.posted_time):
+                try:
+                    posted_time = pd.to_datetime(job.posted_time)
+                except:
+                    pass
+                    
+            due_date = None
+            if hasattr(job, 'due_date') and pd.notna(job.due_date):
+                try:
+                    due_date = pd.to_datetime(job.due_date)
+                except:
+                    pass
+                    
+            # Tạo fact records cho mỗi ngày trong khoảng hiển thị
+            for date_id in dates_to_create:
+                # Xử lý một fact record
+                fact_id = self._process_single_fact_record(
+                    job, job_sk, company_sk, date_id, due_date, 
+                    posted_time, crawled_at, load_month
+                )
+                
+                if fact_id:
+                    # Thêm vào danh sách kết quả
+                    fact_records.append({
+                        'fact_id': fact_id,
+                        'job_sk': job_sk,
+                        'company_sk': company_sk,
+                        'date_id': date_id
+                    })
+                    
+                    # Xử lý location bridges
+                    bridges = self._process_location_bridges(job, fact_id)
+                    if bridges:
+                        bridge_records.extend(bridges)
+                    else:
+                        bridge_skipped += 1
+                
+        logger.info(f"Đã tạo {len(fact_records)} fact records và {len(bridge_records)} bridge records")
+        logger.info(f"Đã bỏ qua {job_skipped} jobs và {bridge_skipped} bridges")
         
         return fact_records, bridge_records
     
@@ -125,36 +174,43 @@ class FactHandler:
         load_month: str
     ) -> Optional[int]:
         """
-        Xử lý một fact record đơn lẻ
+        Xử lý một fact record duy nhất (cập nhật hoặc tạo mới)
         
         Args:
             job: Bản ghi job từ staging
             job_sk: Surrogate key của job
             company_sk: Surrogate key của company
-            date_id: Ngày cần tạo fact record
-            due_date: Ngày hết hạn job
+            date_id: Ngày hiển thị job
+            due_date: Ngày hết hạn
             posted_time: Thời gian đăng job
             crawled_at: Thời gian crawl
-            load_month: Tháng load dữ liệu
+            load_month: Tháng load dữ liệu (YYYY-MM)
             
         Returns:
-            fact_id hoặc None nếu có lỗi
+            fact_id nếu thành công, None nếu thất bại
         """
         try:
-            # Kiểm tra xem fact record đã tồn tại chưa
+            # Kiểm tra xem đã có fact record cho job_sk và date_id hay chưa
             check_query = """
                 SELECT fact_id FROM FactJobPostingDaily 
                 WHERE job_sk = ? AND date_id = ?
             """
-            existing_fact = self.duck_conn.execute(check_query, [job_sk, date_id]).fetchone()
             
-            if existing_fact:
-                # Đã tồn tại, chỉ cập nhật một số field quan trọng
-                fact_id = existing_fact[0]
+            existing = self.duck_conn.execute(check_query, [job_sk, date_id]).fetchone()
+            
+            if existing:
+                # Đã tồn tại, cập nhật thông tin
+                fact_id = existing[0]
                 
+                # Cập nhật các thông tin có thể thay đổi
                 update_query = """
-                    UPDATE FactJobPostingDaily 
+                    UPDATE FactJobPostingDaily
                     SET 
+                        company_sk = ?,
+                        salary_min = ?,
+                        salary_max = ?,
+                        salary_type = ?,
+                        due_date = ?,
                         time_remaining = ?,
                         crawled_at = ?,
                         load_month = ?
@@ -162,6 +218,11 @@ class FactHandler:
                 """
                 
                 update_values = [
+                    company_sk,
+                    job.salary_min if pd.notna(job.salary_min) else None,
+                    job.salary_max if pd.notna(job.salary_max) else None,
+                    job.salary_type if pd.notna(job.salary_type) else None,
+                    due_date,
                     job.time_remaining if pd.notna(job.time_remaining) else None,
                     crawled_at,
                     load_month,
@@ -178,59 +239,104 @@ class FactHandler:
             else:
                 # Chưa tồn tại, tạo mới với transaction để đảm bảo tính nhất quán
                 try:
-                    # Bắt đầu transaction
-                    self.duck_conn.execute("BEGIN TRANSACTION")
+                    # Không bắt đầu transaction mới - transaction có thể được bắt đầu ở cấp cao hơn
+                    # Kiểm tra xem đã có fact record với job_sk và date_id này chưa
+                    double_check = self.duck_conn.execute(
+                        "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", 
+                        [job_sk, date_id]
+                    ).fetchone()
                     
-                    # Kiểm tra lại một lần nữa để tránh race condition
-                    double_check = self.duck_conn.execute(check_query, [job_sk, date_id]).fetchone()
                     if double_check:
                         # Có thể đã được tạo bởi một process khác
-                        self.duck_conn.execute("ROLLBACK")
+                        logger.debug(f"Đã tìm thấy fact record trong lần kiểm tra thứ hai: job_sk={job_sk}, date_id={date_id}")
                         return double_check[0]
                     
-                    # Tạo fact record mới
-                    fact_record = {
-                        'job_sk': job_sk,
-                        'company_sk': company_sk,
-                        'date_id': date_id,
-                        'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
-                        'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
-                        'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
-                        'due_date': due_date,
-                        'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
-                        'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
-                        'posted_time': posted_time,
-                        'crawled_at': crawled_at,
-                        'load_month': load_month
-                    }
-                
-                    # Insert fact record và lấy fact_id
-                    columns = ', '.join([k for k, v in fact_record.items() if v is not None])
-                    placeholders = ', '.join(['?'] * len([v for v in fact_record.values() if v is not None]))
-                    values = [v for v in fact_record.values() if v is not None]
+                    # Tìm giá trị fact_id lớn nhất để đảm bảo tính duy nhất
+                    max_fact_id = self.duck_conn.execute("SELECT COALESCE(MAX(fact_id), 0) + 1000 FROM FactJobPostingDaily").fetchone()[0]
                     
-                    insert_query = f"""
-                        INSERT INTO FactJobPostingDaily ({columns})
-                        VALUES ({placeholders})
-                        RETURNING fact_id
+                    # Tạo fact record mới với fact_id chỉ định để tránh xung đột
+                    insert_query = """
+                        INSERT INTO FactJobPostingDaily (
+                            fact_id, job_sk, company_sk, date_id, 
+                            salary_min, salary_max, salary_type, 
+                            due_date, time_remaining, verified_employer,
+                            posted_time, crawled_at, load_month
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                     
-                    result = self.duck_conn.execute(insert_query, values).fetchone()
-                    if not result:
-                        self.duck_conn.execute("ROLLBACK")
-                        logger.warning(f"Không thể insert fact record cho job_id={job.job_id}, date={date_id}")
-                        return None
+                    insert_values = [
+                        max_fact_id,
+                        job_sk, company_sk, date_id,
+                        job.salary_min if pd.notna(job.salary_min) else None,
+                        job.salary_max if pd.notna(job.salary_max) else None,
+                        job.salary_type if pd.notna(job.salary_type) else None,
+                        due_date,
+                        job.time_remaining if pd.notna(job.time_remaining) else None,
+                        job.verified_employer if pd.notna(job.verified_employer) else False,
+                        posted_time,
+                        crawled_at,
+                        load_month
+                    ]
+                    
+                    try:
+                        self.duck_conn.execute(insert_query, insert_values)
+                        fact_id = max_fact_id
+                        logger.debug(f"Inserted new fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
+                    except Exception as e1:
+                        # Nếu gặp lỗi, có thể là do xung đột với sequence tự tăng
+                        logger.warning(f"Lỗi khi insert với fact_id chỉ định: {e1}")
                         
-                    fact_id = result[0]
-                    
-                    # Commit transaction
-                    self.duck_conn.execute("COMMIT")
-                    
-                    logger.debug(f"Inserted new fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
+                        # Thử insert lại không chỉ định fact_id
+                        try:
+                            default_insert_query = """
+                                INSERT INTO FactJobPostingDaily (
+                                    job_sk, company_sk, date_id, 
+                                    salary_min, salary_max, salary_type, 
+                                    due_date, time_remaining, verified_employer,
+                                    posted_time, crawled_at, load_month
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                RETURNING fact_id
+                            """
+                            
+                            default_values = insert_values[1:]  # Bỏ qua fact_id
+                            result = self.duck_conn.execute(default_insert_query, default_values).fetchone()
+                            if result:
+                                fact_id = result[0]
+                                logger.debug(f"Inserted new fact record (phương pháp 2): job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
+                            else:
+                                logger.warning(f"Không thể insert fact record cho job_id={job.job_id}, date={date_id}")
+                                return None
+                        except Exception as e2:
+                            logger.error(f"Lỗi khi thử insert lần 2: {e2}")
+                            
+                            # Kiểm tra một lần nữa xem record đã được tạo chưa
+                            final_check = self.duck_conn.execute(
+                                "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", 
+                                [job_sk, date_id]
+                            ).fetchone()
+                            
+                            if final_check:
+                                logger.info(f"Đã tìm thấy fact record sau lỗi: job_sk={job_sk}, date_id={date_id}")
+                                return final_check[0]
+                            else:
+                                return None
                     
                 except Exception as e:
-                    # Rollback nếu có lỗi
-                    self.duck_conn.execute("ROLLBACK")
+                    # Không rollback vì transaction có thể được quản lý ở cấp cao hơn
+                    # Kiểm tra một lần nữa xem record đã tồn tại chưa
+                    try:
+                        recovery_check = self.duck_conn.execute(
+                            "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", 
+                            [job_sk, date_id]
+                        ).fetchone()
+                        
+                        if recovery_check:
+                            # Nếu đã có record với (job_sk, date_id) này rồi, sử dụng fact_id đó
+                            logger.warning(f"Recovered existing fact record after error: job_sk={job_sk}, date_id={date_id}")
+                            return recovery_check[0]
+                    except:
+                        pass
+                        
                     logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}, date={date_id}: {e}")
                     return None
             
@@ -319,99 +425,163 @@ class FactHandler:
     def cleanup_duplicate_fact_records(self):
         """
         Dọn dẹp các duplicate records trong FactJobPostingDaily và FactJobLocationBridge
+        Đây là một quá trình quan trọng để đảm bảo tính toàn vẹn dữ liệu
         """
         logger.info("Bắt đầu dọn dẹp duplicate fact records...")
         
         try:
-            # 1. Backup bridge records trước khi xóa
-            logger.info("Backup bridge records...")
-            backup_bridge_query = """
-                CREATE OR REPLACE TEMP TABLE bridge_backup AS
-                SELECT DISTINCT fact_id, location_sk 
-                FROM FactJobLocationBridge
-            """
-            self.duck_conn.execute(backup_bridge_query)
+            # Đảm bảo kết nối ổn định
+            try:
+                self.duck_conn.execute("PRAGMA foreign_keys = OFF")
+            except:
+                logger.warning("Không thể tắt foreign keys - có thể DuckDB không hỗ trợ")
             
-            # 2. Tìm và xóa duplicate fact records, giữ lại record có fact_id nhỏ nhất
-            logger.info("Tìm duplicate fact records...")
-            find_duplicates_query = """
-                SELECT job_sk, date_id, COUNT(*) as count, MIN(fact_id) as keep_fact_id
-                FROM FactJobPostingDaily
-                GROUP BY job_sk, date_id
-                HAVING COUNT(*) > 1
-            """
+            # Bắt đầu transaction
+            self.duck_conn.execute("BEGIN TRANSACTION")
             
-            duplicates = self.duck_conn.execute(find_duplicates_query).fetchdf()
-            
-            if not duplicates.empty:
-                logger.info(f"Tìm thấy {len(duplicates)} nhóm duplicate fact records")
+            try:
+                # 1. Tạo bảng backup cho FactJobPostingDaily và FactJobLocationBridge
+                logger.info("Tạo bảng backup...")
+                self.duck_conn.execute("CREATE TEMP TABLE IF NOT EXISTS fact_backup AS SELECT * FROM FactJobPostingDaily")
+                self.duck_conn.execute("CREATE TEMP TABLE IF NOT EXISTS bridge_backup AS SELECT * FROM FactJobLocationBridge")
                 
-                total_deleted = 0
-                for _, dup in duplicates.iterrows():
-                    job_sk, date_id, count, keep_fact_id = dup['job_sk'], dup['date_id'], dup['count'], dup['keep_fact_id']
-                    
-                    # Lấy danh sách fact_id cần xóa (tất cả trừ keep_fact_id)
-                    get_delete_ids_query = """
-                        SELECT fact_id FROM FactJobPostingDaily
-                        WHERE job_sk = ? AND date_id = ? AND fact_id != ?
-                    """
-                    delete_ids = self.duck_conn.execute(get_delete_ids_query, [job_sk, date_id, keep_fact_id]).fetchall()
-                    
-                    if delete_ids:
-                        fact_ids_to_delete = [row[0] for row in delete_ids]
-                        placeholders = ','.join(['?'] * len(fact_ids_to_delete))
-                        
-                        # Xóa bridge records trước
-                        delete_bridge_query = f"""
-                            DELETE FROM FactJobLocationBridge 
-                            WHERE fact_id IN ({placeholders})
-                        """
-                        self.duck_conn.execute(delete_bridge_query, fact_ids_to_delete)
-                        
-                        # Xóa fact records
-                        delete_fact_query = f"""
-                            DELETE FROM FactJobPostingDaily 
-                            WHERE fact_id IN ({placeholders})
-                        """
-                        self.duck_conn.execute(delete_fact_query, fact_ids_to_delete)
-                        
-                        total_deleted += len(fact_ids_to_delete)
-                        logger.debug(f"Đã xóa {len(fact_ids_to_delete)} duplicate records cho job_sk={job_sk}, date_id={date_id}")
-                
-                logger.info(f"Đã xóa tổng cộng {total_deleted} duplicate fact records")
-                
-                # 3. Restore bridge records cho các fact_id còn lại
-                logger.info("Restore bridge records...")
-                restore_bridge_query = """
-                    INSERT INTO FactJobLocationBridge (fact_id, location_sk)
-                    SELECT DISTINCT b.fact_id, b.location_sk
-                    FROM bridge_backup b
-                    JOIN FactJobPostingDaily f ON b.fact_id = f.fact_id
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM FactJobLocationBridge fb 
-                        WHERE fb.fact_id = b.fact_id AND fb.location_sk = b.location_sk
-                    )
+                # 2. Tìm các duplicate records trong FactJobPostingDaily
+                logger.info("Tìm duplicate fact records...")
+                find_duplicates_query = """
+                    SELECT job_sk, date_id, COUNT(*) as count, MIN(fact_id) as keep_fact_id
+                    FROM FactJobPostingDaily
+                    GROUP BY job_sk, date_id
+                    HAVING COUNT(*) > 1
                 """
-                self.duck_conn.execute(restore_bridge_query)
                 
-            else:
-                logger.info("Không tìm thấy duplicate fact records")
+                duplicates = self.duck_conn.execute(find_duplicates_query).fetchdf()
                 
-            # 4. Thống kê sau khi dọn dẹp
-            stats_query = """
-                SELECT 
-                    COUNT(*) as total_facts,
-                    (SELECT COUNT(*) FROM (SELECT DISTINCT job_sk, date_id FROM FactJobPostingDaily)) as unique_combinations
-                FROM FactJobPostingDaily
-            """
-            stats = self.duck_conn.execute(stats_query).fetchone()
-            logger.info(f"Sau dọn dẹp: {stats[0]} fact records, {stats[1]} unique combinations")
-            
-            if stats[0] != stats[1]:
-                logger.warning(f"Vẫn còn {stats[0] - stats[1]} duplicate records!")
-            else:
-                logger.info("✅ Đã dọn dẹp thành công tất cả duplicate records")
+                if not duplicates.empty:
+                    logger.info(f"Tìm thấy {len(duplicates)} nhóm duplicate fact records")
+                    
+                    # 3. Xóa tất cả các FactJobLocationBridge liên quan đến duplicate fact records
+                    for _, dup in duplicates.iterrows():
+                        job_sk, date_id, count, keep_fact_id = dup['job_sk'], dup['date_id'], dup['count'], dup['keep_fact_id']
+                        
+                        # Lấy tất cả fact_id cho job_sk và date_id này
+                        get_all_fact_ids_query = """
+                            SELECT fact_id FROM FactJobPostingDaily
+                            WHERE job_sk = ? AND date_id = ?
+                        """
+                        all_fact_ids = self.duck_conn.execute(get_all_fact_ids_query, [job_sk, date_id]).fetchall()
+                        all_fact_ids = [row[0] for row in all_fact_ids]
+                        
+                        if len(all_fact_ids) > 1:
+                            # Xóa tất cả bridge records liên quan đến các fact_id này
+                            placeholders = ','.join(['?'] * len(all_fact_ids))
+                            self.duck_conn.execute(f"DELETE FROM FactJobLocationBridge WHERE fact_id IN ({placeholders})", all_fact_ids)
+                            
+                            # Xóa tất cả fact records liên quan đến job_sk và date_id này
+                            self.duck_conn.execute("DELETE FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", [job_sk, date_id])
+                            
+                            # Tạo lại fact record mới với fact_id nhỏ nhất
+                            get_original_fact_query = """
+                                SELECT * FROM fact_backup 
+                                WHERE fact_id = ?
+                            """
+                            original_fact = self.duck_conn.execute(get_original_fact_query, [keep_fact_id]).fetchone()
+                            
+                            if original_fact:
+                                # Tạo câu lệnh INSERT mới cho fact record
+                                columns = self.duck_conn.execute("PRAGMA table_info(FactJobPostingDaily)").fetchdf()['name'].tolist()
+                                placeholders = ','.join(['?'] * len(columns))
+                                insert_query = f"INSERT INTO FactJobPostingDaily ({','.join(columns)}) VALUES ({placeholders})"
+                                
+                                self.duck_conn.execute(insert_query, original_fact)
+                                logger.debug(f"Đã tạo lại fact record cho job_sk={job_sk}, date_id={date_id} với fact_id={keep_fact_id}")
+                                
+                                # Tạo lại bridge records cho fact_id này
+                                get_bridge_records_query = """
+                                    SELECT location_sk FROM bridge_backup 
+                                    WHERE fact_id = ?
+                                """
+                                bridge_records = self.duck_conn.execute(get_bridge_records_query, [keep_fact_id]).fetchall()
+                                
+                                for bridge in bridge_records:
+                                    location_sk = bridge[0]
+                                    self.duck_conn.execute(
+                                        "INSERT INTO FactJobLocationBridge (fact_id, location_sk) VALUES (?, ?)",
+                                        [keep_fact_id, location_sk]
+                                    )
+                    
+                    # 4. Kiểm tra kết quả sau khi xử lý
+                    check_duplicates_query = """
+                        SELECT COUNT(*) FROM (
+                            SELECT job_sk, date_id, COUNT(*) 
+                            FROM FactJobPostingDaily 
+                            GROUP BY job_sk, date_id 
+                            HAVING COUNT(*) > 1
+                        )
+                    """
+                    remaining_duplicates = self.duck_conn.execute(check_duplicates_query).fetchone()[0]
+                    
+                    if remaining_duplicates > 0:
+                        logger.warning(f"Vẫn còn {remaining_duplicates} nhóm duplicate sau khi xử lý!")
+                    else:
+                        logger.info("✅ Đã xử lý tất cả duplicate records thành công")
+                
+                else:
+                    logger.info("Không tìm thấy duplicate fact records")
+                
+                # 5. Xóa bảng tạm
+                self.duck_conn.execute("DROP TABLE IF EXISTS fact_backup")
+                self.duck_conn.execute("DROP TABLE IF EXISTS bridge_backup")
+                
+                # 6. Commit transaction
+                self.duck_conn.execute("COMMIT")
+                
+                # 7. Phân tích lại bảng để tối ưu hiệu suất
+                try:
+                    self.duck_conn.execute("ANALYZE FactJobPostingDaily")
+                    self.duck_conn.execute("ANALYZE FactJobLocationBridge")
+                except:
+                    logger.warning("Không thể thực hiện ANALYZE - có thể DuckDB không hỗ trợ")
+                
+                # 8. Kiểm tra lại và báo cáo
+                stats_query = """
+                    SELECT 
+                        COUNT(*) as total_facts,
+                        (SELECT COUNT(*) FROM (SELECT DISTINCT job_sk, date_id FROM FactJobPostingDaily)) as unique_combinations
+                    FROM FactJobPostingDaily
+                """
+                stats = self.duck_conn.execute(stats_query).fetchone()
+                logger.info(f"Sau dọn dẹp: {stats[0]} fact records, {stats[1]} unique combinations")
+                
+                # Reset PRAGMA settings
+                try:
+                    self.duck_conn.execute("PRAGMA foreign_keys = ON")
+                except:
+                    pass
+                
+                return {
+                    "success": True,
+                    "message": f"Đã dọn dẹp duplicate records, còn lại {stats[0]} records"
+                }
+                
+            except Exception as e:
+                # Rollback nếu có lỗi
+                self.duck_conn.execute("ROLLBACK")
+                logger.error(f"Lỗi khi dọn dẹp duplicate records: {e}")
+                
+                # Reset PRAGMA settings
+                try:
+                    self.duck_conn.execute("PRAGMA foreign_keys = ON")
+                except:
+                    pass
+                
+                return {
+                    "success": False,
+                    "message": f"Lỗi: {str(e)}"
+                }
                 
         except Exception as e:
-            logger.error(f"Lỗi khi dọn dẹp duplicate records: {e}")
-            raise
+            logger.error(f"Lỗi critical khi dọn dẹp duplicate records: {e}")
+            return {
+                "success": False,
+                "message": f"Critical error: {str(e)}"
+            }

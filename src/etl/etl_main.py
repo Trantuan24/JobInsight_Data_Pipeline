@@ -130,28 +130,25 @@ def verify_etl_integrity(staging_count: int, fact_count: int, threshold: float =
 
 def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str, Any]:
     """
-    Thực hiện quy trình ETL chuyển dữ liệu từ Staging sang Data Warehouse
+    Chạy ETL từ staging sang DWH
     
     Args:
-        last_etl_date: Timestamp của lần ETL gần nhất, mặc định là 7 ngày trước
+        last_etl_date: Ngày chạy ETL gần nhất, lấy dữ liệu từ ngày này đến hiện tại
         
     Returns:
-        Dict[str, Any]: Kết quả thống kê ETL
+        Dict thông tin về kết quả ETL
     """
     start_time = datetime.now()
+    logger.info(f"🚀 Bắt đầu ETL Staging to DWH...")
     
     try:
-        # Thiết lập ngày ETL gần nhất nếu không có
+        # 1. Lấy dữ liệu từ staging
         if last_etl_date is None:
             last_etl_date = datetime.now() - timedelta(days=7)
-        
-        logger.info("="*60)
-        logger.info(f"🚀 BẮT ĐẦU ETL STAGING TO DWH - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"🕒 Lấy dữ liệu từ: {last_etl_date}")
-        logger.info("="*60)
-        
-        # 1. Lấy dữ liệu từ staging
+            
+        logger.info(f"Lấy dữ liệu từ staging từ {last_etl_date}...")
         staging_batch = get_staging_batch(last_etl_date)
+        
         if staging_batch.empty:
             logger.info("Không có bản ghi nào để xử lý từ staging")
             return {
@@ -187,9 +184,79 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
             fact_handler = FactHandler(duck_conn)
             partition_manager = PartitionManager(duck_conn)
             
-            # Dọn dẹp duplicate records hiện có (chạy 1 lần)
+            # Kiểm tra tính toàn vẹn dữ liệu ban đầu
+            logger.info("🔍 Kiểm tra tính toàn vẹn dữ liệu ban đầu...")
+            initial_integrity_check = duck_conn.execute("""
+                SELECT 
+                    (SELECT COUNT(*) FROM FactJobPostingDaily) as total_facts,
+                    (SELECT COUNT(*) FROM (SELECT DISTINCT job_sk, date_id FROM FactJobPostingDaily)) as unique_combinations
+            """).fetchone()
+            
+            if initial_integrity_check and initial_integrity_check[0] != initial_integrity_check[1]:
+                logger.warning(f"⚠️ Phát hiện vấn đề trùng lặp dữ liệu: {initial_integrity_check[0]} facts, {initial_integrity_check[1]} unique combinations")
+            
+            # Dọn dẹp duplicate records hiện có
             logger.info("🧹 Dọn dẹp duplicate records hiện có...")
-            fact_handler.cleanup_duplicate_fact_records()
+            cleanup_result = fact_handler.cleanup_duplicate_fact_records()
+            if not cleanup_result.get('success', False):
+                logger.warning(f"⚠️ Có vấn đề trong quá trình dọn dẹp: {cleanup_result.get('message', 'Unknown error')}")
+            
+            # Kiểm tra lại sau khi dọn dẹp
+            post_cleanup_check = duck_conn.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT job_sk, date_id, COUNT(*) 
+                    FROM FactJobPostingDaily 
+                    GROUP BY job_sk, date_id 
+                    HAVING COUNT(*) > 1
+                )
+            """).fetchone()
+            
+            if post_cleanup_check and post_cleanup_check[0] > 0:
+                logger.warning(f"⚠️ Vẫn còn {post_cleanup_check[0]} nhóm duplicate sau khi dọn dẹp - cần phân tích sâu hơn!")
+                
+                # Thử sửa chữa bằng cách force cleanup
+                logger.info("Thực hiện force cleanup để sửa chữa dữ liệu...")
+                duck_conn.execute("""
+                    BEGIN TRANSACTION;
+                    
+                    -- Tạo bảng tạm để lưu unique records
+                    CREATE TEMP TABLE unique_facts AS
+                    SELECT * FROM (
+                        SELECT *, ROW_NUMBER() OVER (PARTITION BY job_sk, date_id ORDER BY fact_id) as rn
+                        FROM FactJobPostingDaily
+                    ) WHERE rn = 1;
+                    
+                    -- Xóa hết bridge tables
+                    DELETE FROM FactJobLocationBridge;
+                    
+                    -- Xóa hết facts
+                    DELETE FROM FactJobPostingDaily;
+                    
+                    -- Insert lại unique facts (bỏ cột rn)
+                    INSERT INTO FactJobPostingDaily 
+                    SELECT fact_id, job_sk, company_sk, date_id, 
+                           salary_min, salary_max, salary_type, 
+                           due_date, time_remaining, verified_employer, 
+                           posted_time, crawled_at, load_month
+                    FROM unique_facts;
+                    
+                    -- Xóa bảng tạm
+                    DROP TABLE unique_facts;
+                    
+                    COMMIT;
+                """)
+                
+                # Kiểm tra lại sau khi force cleanup
+                final_check = duck_conn.execute("""
+                    SELECT 
+                        (SELECT COUNT(*) FROM FactJobPostingDaily) as total_facts,
+                        (SELECT COUNT(*) FROM (SELECT DISTINCT job_sk, date_id FROM FactJobPostingDaily)) as unique_combinations
+                """).fetchone()
+                
+                if final_check and final_check[0] == final_check[1]:
+                    logger.info(f"✅ Force cleanup thành công: {final_check[0]} facts, {final_check[1]} unique combinations")
+                else:
+                    logger.error(f"❌ Force cleanup thất bại: {final_check[0]} facts, {final_check[1]} unique combinations")
             
             # 5. Xử lý và insert dữ liệu với SCD Type 2
             dim_stats = {}
@@ -234,15 +301,36 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
         
             # 5.5. Insert dữ liệu vào FactJobPostingDaily và FactJobLocationBridge
             logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
-            fact_records, bridge_records = fact_handler.generate_fact_records(staging_batch)
+            
+            # Thực hiện transaction riêng cho việc tạo fact records
+            try:
+                # Tạo fact records mà không sử dụng transaction nội bộ
+                fact_records, bridge_records = fact_handler.generate_fact_records(staging_batch)
+                logger.info(f"Đã xử lý {len(fact_records)} bản ghi fact và {len(bridge_records)} bản ghi bridge")
+            except Exception as e:
+                logger.error(f"Lỗi khi tạo fact records: {str(e)}")
+                raise
             
             # Kiểm tra tính toàn vẹn của dữ liệu
             if not verify_etl_integrity(len(staging_batch), len(fact_records)):
                 logger.warning("⚠️ Phát hiện vấn đề về tính toàn vẹn dữ liệu trong quá trình ETL!")
-                # Vẫn tiếp tục nhưng đã cảnh báo
             
-            logger.info(f"Đã xử lý {len(fact_records)} bản ghi fact và {len(bridge_records)} bản ghi bridge")
-        
+            # Kiểm tra duplicate một lần nữa
+            duplicate_check = duck_conn.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT job_sk, date_id, COUNT(*) 
+                    FROM FactJobPostingDaily 
+                    GROUP BY job_sk, date_id 
+                    HAVING COUNT(*) > 1
+                )
+            """).fetchone()
+            
+            if duplicate_check and duplicate_check[0] > 0:
+                logger.warning(f"⚠️ Phát hiện {duplicate_check[0]} nhóm duplicate sau khi insert - cần chạy lại cleanup!")
+                cleanup_result_2 = fact_handler.cleanup_duplicate_fact_records()
+                if not cleanup_result_2.get('success', False):
+                    logger.warning(f"⚠️ Vẫn có vấn đề trong cleanup: {cleanup_result_2.get('message', 'Unknown error')}")
+            
             # 6. Quản lý partition và export sang Parquet
             logger.info("📊 Quản lý partition và export sang Parquet")
             partition_result = partition_manager.manage_partitions()

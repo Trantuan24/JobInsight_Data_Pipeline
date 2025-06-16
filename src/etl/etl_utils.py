@@ -117,6 +117,35 @@ def setup_duckdb_schema() -> bool:
                     logger.info(f"✓ Bảng {table} đã được tạo thành công")
                 else:
                     logger.warning(f"✗ Bảng {table} KHÔNG được tạo thành công")
+            
+            # Đặt lại giá trị của các sequence dựa trên dữ liệu hiện có
+            logger.info("🔄 Đặt lại giá trị của các sequence dựa trên dữ liệu hiện có...")
+            sequence_results = reset_sequences(conn)
+            
+            # Kiểm tra kết quả reset sequence
+            sequence_failures = []
+            for sequence, value in sequence_results.items():
+                if isinstance(value, int) and value > 0:
+                    logger.info(f"✓ Sequence {sequence} đã được đặt lại thành {value}")
+                else:
+                    logger.warning(f"⚠️ Sequence {sequence}: {value}")
+                    sequence_failures.append(sequence)
+            
+            # Nếu thất bại với sequence fact_id, thử reset fact tables
+            if 'seq_fact_id' in sequence_failures:
+                logger.warning("⚠️ Không thể đặt lại sequence fact_id. Thử reset fact tables...")
+                
+                # Kiểm tra số bản ghi để quyết định có nên reset hay không
+                fact_count = conn.execute("SELECT COUNT(*) FROM FactJobPostingDaily").fetchone()[0]
+                
+                if fact_count > 0:
+                    # Chỉ reset nếu có bản ghi (tránh reset không cần thiết)
+                    if reset_fact_tables(conn):
+                        logger.info("✅ Đã reset fact tables thành công")
+                    else:
+                        logger.warning("⚠️ Không thể reset fact tables")
+                else:
+                    logger.info("ℹ️ Bảng fact trống, không cần reset")
 
         logger.info("Đã thiết lập schema và bảng database thành công cho DuckDB!")
         return True
@@ -299,4 +328,188 @@ def lookup_location_key(
         return None
     except Exception as e:
         logger.error(f"Lỗi khi tìm location_sk: {e}")
-        return None 
+        return None
+
+def reset_sequences(duck_conn: duckdb.DuckDBPyConnection) -> Dict[str, int]:
+    """
+    Đặt lại các sequence ID dựa trên giá trị lớn nhất hiện có trong bảng
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        
+    Returns:
+        Dict chứa tên sequence và giá trị mới
+    """
+    results = {}
+    
+    try:
+        # Danh sách các bảng và các sequence tương ứng
+        tables_and_sequences = [
+            ('DimJob', 'seq_dim_job_sk', 'job_sk'),
+            ('DimCompany', 'seq_dim_company_sk', 'company_sk'),
+            ('DimLocation', 'seq_dim_location_sk', 'location_sk'),
+            ('FactJobPostingDaily', 'seq_fact_id', 'fact_id')
+        ]
+        
+        for table, sequence, id_column in tables_and_sequences:
+            # Kiểm tra xem bảng có dữ liệu không
+            count_query = f"SELECT COUNT(*) FROM {table}"
+            count = duck_conn.execute(count_query).fetchone()[0]
+            
+            if count > 0:
+                # Lấy giá trị lớn nhất của id_column
+                max_query = f"SELECT MAX({id_column}) FROM {table}"
+                max_id = duck_conn.execute(max_query).fetchone()[0]
+                
+                if max_id is not None:
+                    # Đặt lại giá trị sequence bắt đầu từ max_id + 1
+                    new_start = max_id + 1
+                    try:
+                        # Cố gắng sử dụng ALTER SEQUENCE để đặt lại giá trị
+                        try:
+                            # Phương pháp 1: Sử dụng ALTER SEQUENCE ... RESTART WITH
+                            alter_query = f"ALTER SEQUENCE {sequence} RESTART WITH {new_start}"
+                            duck_conn.execute(alter_query)
+                            logger.info(f"Đã đặt lại sequence {sequence} bắt đầu từ {new_start} (phương pháp ALTER)")
+                            results[sequence] = new_start
+                        except Exception as e1:
+                            logger.warning(f"Không thể sử dụng ALTER SEQUENCE: {e1}")
+                            
+                            try:
+                                # Phương pháp 2: Sử dụng setval() nếu có
+                                setval_query = f"SELECT setval('{sequence}', {new_start})"
+                                duck_conn.execute(setval_query)
+                                logger.info(f"Đã đặt lại sequence {sequence} bắt đầu từ {new_start} (phương pháp setval)")
+                                results[sequence] = new_start
+                            except Exception as e2:
+                                logger.warning(f"Không thể sử dụng setval: {e2}")
+                                
+                                # Phương pháp 3: Sử dụng nextval() để tiêu thụ giá trị cho đến khi đạt đến giá trị mong muốn
+                                try:
+                                    # Lấy giá trị hiện tại của sequence
+                                    current_val_query = f"SELECT nextval('{sequence}')"
+                                    current_val = duck_conn.execute(current_val_query).fetchone()[0]
+                                    
+                                    # Tiêu thụ giá trị cho đến khi đạt đến giá trị mong muốn
+                                    if current_val < new_start:
+                                        duck_conn.execute(f"""
+                                            DO $$
+                                            DECLARE
+                                                current_val BIGINT;
+                                            BEGIN
+                                                SELECT nextval('{sequence}') INTO current_val;
+                                                WHILE current_val < {new_start} LOOP
+                                                    SELECT nextval('{sequence}') INTO current_val;
+                                                END LOOP;
+                                            END
+                                            $$;
+                                        """)
+                                        logger.info(f"Đã đặt lại sequence {sequence} bắt đầu từ {new_start} (phương pháp nextval)")
+                                        results[sequence] = new_start
+                                    else:
+                                        logger.warning(f"Sequence {sequence} đã có giá trị ({current_val}) lớn hơn giá trị mong muốn ({new_start})")
+                                        results[sequence] = current_val
+                                except Exception as e3:
+                                    logger.warning(f"Không thể sử dụng nextval: {e3}")
+                                    results[sequence] = -1
+                    except Exception as e:
+                        logger.warning(f"Không thể đặt lại sequence {sequence}: {e}")
+                        results[sequence] = -1
+            else:
+                # Nếu bảng không có dữ liệu, đặt lại sequence về 1
+                try:
+                    try:
+                        alter_query = f"ALTER SEQUENCE {sequence} RESTART WITH 1"
+                        duck_conn.execute(alter_query)
+                    except:
+                        try:
+                            setval_query = f"SELECT setval('{sequence}', 1)"
+                            duck_conn.execute(setval_query)
+                        except:
+                            logger.warning(f"Không thể đặt lại sequence {sequence} về 1")
+                            
+                    logger.info(f"Bảng {table} không có dữ liệu, đặt sequence {sequence} bắt đầu từ 1")
+                    results[sequence] = 1
+                except Exception as e:
+                    logger.warning(f"Không thể đặt lại sequence {sequence}: {e}")
+                    results[sequence] = -1
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"Lỗi khi đặt lại các sequence: {e}")
+        return {"error": str(e)}
+
+def reset_fact_tables(duck_conn: duckdb.DuckDBPyConnection) -> bool:
+    """
+    Reset các bảng fact khi cần thiết.
+    Phương án cuối cùng để giải quyết vấn đề sequence trùng lặp.
+    
+    Args:
+        duck_conn: Kết nối DuckDB
+        
+    Returns:
+        bool: True nếu thành công, False nếu thất bại
+    """
+    try:
+        logger.warning("⚠️ RESET FACT TABLES: Bắt đầu xóa và tạo lại các bảng fact...")
+        
+        # Bắt đầu transaction
+        duck_conn.execute("BEGIN TRANSACTION")
+        
+        try:
+            # 1. Backup dữ liệu hiện có (nếu cần)
+            logger.info("Tạo bảng backup...")
+            duck_conn.execute("CREATE TEMP TABLE IF NOT EXISTS fact_backup AS SELECT * FROM FactJobPostingDaily")
+            duck_conn.execute("CREATE TEMP TABLE IF NOT EXISTS bridge_backup AS SELECT * FROM FactJobLocationBridge")
+            
+            # 2. Đếm số bản ghi trước khi xóa
+            count_fact = duck_conn.execute("SELECT COUNT(*) FROM FactJobPostingDaily").fetchone()[0]
+            count_bridge = duck_conn.execute("SELECT COUNT(*) FROM FactJobLocationBridge").fetchone()[0]
+            logger.info(f"Số bản ghi trước khi reset: {count_fact} fact records, {count_bridge} bridge records")
+            
+            # 3. Xóa tất cả dữ liệu từ bridge table trước (do phụ thuộc khóa ngoại)
+            duck_conn.execute("DELETE FROM FactJobLocationBridge")
+            
+            # 4. Xóa tất cả dữ liệu từ fact table
+            duck_conn.execute("DELETE FROM FactJobPostingDaily")
+            
+            # 5. Reset sequence về giá trị lớn (an toàn)
+            try:
+                duck_conn.execute("DROP SEQUENCE IF EXISTS seq_fact_id")
+                duck_conn.execute("CREATE SEQUENCE seq_fact_id START 10000")
+                logger.info("Đã tạo lại sequence seq_fact_id bắt đầu từ 10000")
+            except Exception as e:
+                logger.warning(f"Không thể reset sequence seq_fact_id: {e}")
+                
+                try:
+                    # Thử với phương pháp khác nếu có
+                    duck_conn.execute("ALTER SEQUENCE seq_fact_id RESTART WITH 10000")
+                    logger.info("Đã đặt lại sequence seq_fact_id bắt đầu từ 10000 (phương pháp ALTER)")
+                except Exception as e2:
+                    logger.warning(f"Không thể đặt lại sequence seq_fact_id: {e2}")
+            
+            # 6. Tạo lại bảng fact và bridge từ các file SQL nếu cần
+            
+            # 7. Commit transaction
+            duck_conn.execute("COMMIT")
+            
+            # Kiểm tra kết quả
+            count_fact_after = duck_conn.execute("SELECT COUNT(*) FROM FactJobPostingDaily").fetchone()[0]
+            count_bridge_after = duck_conn.execute("SELECT COUNT(*) FROM FactJobLocationBridge").fetchone()[0]
+            
+            if count_fact_after == 0 and count_bridge_after == 0:
+                logger.info("✅ Đã reset thành công các bảng fact")
+                return True
+            else:
+                logger.warning(f"⚠️ Reset không hoàn toàn: còn lại {count_fact_after} fact records, {count_bridge_after} bridge records")
+                return False
+            
+        except Exception as e:
+            duck_conn.execute("ROLLBACK")
+            logger.error(f"Lỗi khi reset fact tables: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Lỗi critical khi reset fact tables: {e}")
+        return False 
