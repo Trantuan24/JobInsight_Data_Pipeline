@@ -2,6 +2,7 @@
 
 # Đảm bảo thứ tự import đúng để tránh circular import
 from src.ingestion.data_processor import prepare_job_data, validate_utf8
+from src.db.bulk_operations import DBBulkOperations
 from src.ingestion.db_operations import batch_insert_records, insert_record, ensure_table_exists
 from src.ingestion.cdc import save_cdc_record
 from src.ingestion.ingest import ingest_dataframe, bulk_upsert_jobs, replay_cdc_records, list_cdc_files
@@ -9,6 +10,7 @@ from src.ingestion.ingest import ingest_dataframe, bulk_upsert_jobs, replay_cdc_
 __all__ = [
     'prepare_job_data',
     'validate_utf8',
+    'DBBulkOperations',
     'batch_insert_records',
     'insert_record',
     'ensure_table_exists',

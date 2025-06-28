@@ -6,9 +6,6 @@ from airflow.sensors.external_task import ExternalTaskSensor
 import sys
 import os
 
-# Thêm đường dẫn để import các modules từ src
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)) + "/..")
-
 # Import các modules cần thiết
 from src.processing.data_prepare import prepare_dim_job, prepare_dim_company, prepare_dim_location
 from src.processing.data_processing import clean_title, extract_location_info
@@ -23,19 +20,53 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-def etl_raw_to_staging():
+def etl_raw_to_staging(batch_size=5000, only_unprocessed=False, verbose=False):
     """
     Thực hiện ETL từ raw_jobs sang staging_jobs
+    
+    Args:
+        batch_size (int): Số lượng bản ghi xử lý mỗi batch, mặc định là 5000
+        only_unprocessed (bool): Chỉ xử lý các bản ghi chưa được xử lý, mặc định là False
+        verbose (bool): Hiển thị thêm thông tin chi tiết, mặc định là False
+        
+    Returns:
+        str: Thông tin kết quả ETL
     """
-    from src.etl.raw_to_staging import run_etl
+    from src.etl import run_etl
+    import json
     
-    # Sử dụng hàm run_etl từ module raw_to_staging
-    success = run_etl()
+    print(f"Bắt đầu ETL Raw to Staging với batch_size={batch_size}, only_unprocessed={only_unprocessed}")
     
-    if success:
-        return "ETL raw_to_staging completed successfully"
-    else:
-        raise Exception("ETL raw_to_staging failed")
+    try:
+        # Sử dụng hàm run_etl từ module raw_to_staging với các tham số
+        result = run_etl(batch_size=batch_size, only_unprocessed=only_unprocessed, verbose=verbose)
+        
+        # Kiểm tra kết quả
+        success = result.get('success', False) is not False  # Nếu không có key 'success' hoặc success=True
+    
+        if success:
+            # Lấy stats từ kết quả
+            stats = result.get('stats', {})
+            
+            print(f"✅ ETL raw_to_staging hoàn thành thành công!")
+            print(f"Thống kê ETL:")
+            print(f"- Tổng số bản ghi: {stats.get('total_records', 0):,}")
+            print(f"- Số bản ghi đã xử lý: {stats.get('processed_records', 0):,}")
+            print(f"- Số bản ghi thành công: {stats.get('success_count', 0):,}")
+            print(f"- Số bản ghi lỗi: {stats.get('failure_count', 0):,}")
+            print(f"- Tỷ lệ thành công: {stats.get('success_rate', 0):.2f}%")
+            print(f"- Thời gian xử lý: {stats.get('duration_seconds', 0):.2f} giây")
+            print(f"- Số batch đã xử lý: {stats.get('batch_count', 0)}")
+            
+            return f"ETL raw_to_staging completed successfully: {json.dumps(stats)}"
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            print(f"❌ ETL raw_to_staging thất bại: {error_msg}")
+            raise Exception(f"ETL raw_to_staging failed: {error_msg}")
+            
+    except Exception as e:
+        print(f"❌ ETL raw_to_staging thất bại với lỗi không xác định: {str(e)}")
+        raise
 
 def etl_staging_to_dwh():
     """
@@ -159,7 +190,7 @@ with DAG(
     'jobinsight_etl_pipeline',
     default_args=default_args,
     description='ETL pipeline for JobInsight data processing',
-    schedule_interval='0 5 * * *',  # Run at 5:00 AM Vietnam time (Asia/Ho_Chi_Minh)
+    schedule_interval='40 17 * * *',  # Run at 11:00 AM Vietnam time (Asia/Ho_Chi_Minh)
     start_date=datetime(2023, 10, 1),
     catchup=False,
     tags=['jobinsight', 'etl'],
@@ -187,6 +218,11 @@ with DAG(
     raw_to_staging_task = PythonOperator(
         task_id='raw_to_staging',
         python_callable=etl_raw_to_staging,
+        op_kwargs={
+            'batch_size': 5000,            # Xử lý 5000 bản ghi mỗi batch
+            'only_unprocessed': True,      # Chỉ xử lý bản ghi chưa được xử lý
+            'verbose': False               # Không hiển thị thông tin chi tiết
+        }
     )
 
     # Task ETL từ staging sang DWH

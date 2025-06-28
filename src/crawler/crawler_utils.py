@@ -4,8 +4,6 @@ from datetime import datetime
 import sys
 import os
 
-# Thêm đường dẫn gốc dự án vào sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 # Import modules
 try:

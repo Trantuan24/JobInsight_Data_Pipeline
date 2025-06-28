@@ -11,7 +11,6 @@ from typing import Dict, Any, List
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-sys.path.insert(0, PROJECT_ROOT)
 
 # Đảm bảo thư mục logs tồn tại
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
@@ -36,15 +35,22 @@ try:
     from src.ingestion.data_processor import prepare_job_data
     from src.ingestion.db_operations import batch_insert_records, ensure_table_exists
     from src.ingestion.cdc import save_cdc_record
+    from src.utils.path_helpers import ensure_dir
+    from src.common.decorators import retry
 except ImportError as e:
     # Thử cách thay thế
-    sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
-    from utils.config import DB_CONFIG, RAW_JOBS_TABLE, RAW_BATCH_SIZE
-    from utils.db import get_connection, execute_query, table_exists, get_engine
-    from utils.logger import get_logger
-    from ingestion.data_processor import prepare_job_data
-    from ingestion.db_operations import batch_insert_records, ensure_table_exists
-    from ingestion.cdc import save_cdc_record
+    from src.utils.config import DB_CONFIG, RAW_JOBS_TABLE, RAW_BATCH_SIZE
+    from src.utils.db import get_connection, execute_query, table_exists, get_engine
+    from src.utils.logger import get_logger
+    from src.ingestion.data_processor import prepare_job_data
+    from src.ingestion.db_operations import batch_insert_records, ensure_table_exists
+    from src.ingestion.cdc import save_cdc_record
+    from src.utils.path_helpers import ensure_dir
+    # Fallback cho retry decorator
+    def retry(max_tries=3, delay_seconds=1.0, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
@@ -54,38 +60,68 @@ if not os.path.exists(SQL_DIR):
 
 # Constants
 BATCH_SIZE = 1000  # Insert theo batch để tối ưu performance
-CDC_DIR = "data/cdc"
-os.makedirs(CDC_DIR, exist_ok=True)
+CDC_DIR = os.path.join(PROJECT_ROOT, "data/cdc")
+ensure_dir(CDC_DIR)
 
+@retry(max_tries=3, delay_seconds=2.0, backoff_factor=1.5, logger=logger)
 def bulk_upsert_jobs(df: pd.DataFrame, batch_size: int = BATCH_SIZE) -> Dict[str, int]:
     """Bulk UPSERT jobs vào database"""
     if df.empty:
         logger.warning("No data to ingest")
-        return {'inserted': 0, 'updated': 0, 'errors': 0}
+        return {'inserted': 0, 'updated': 0, 'errors': 0, 'cdc_success': 0, 'cdc_errors': 0}
     
-    # Ensure job_id is string
+    # Đảm bảo job_id là string
     df['job_id'] = df['job_id'].astype(str)
     
-    # Prepare records
+    # Chuẩn bị records
     records = []
     for _, row in df.iterrows():
-        data = prepare_job_data(row, False)  # Assume new records for simplicity
+        data = prepare_job_data(row, False)  # Giả định là records mới để đơn giản hóa
         records.append(data)
     
     # Batch insert
     inserted, updated, errors = batch_insert_records(records, batch_size)
     
-    # Log CDC records
+    # Log CDC records với thông tin chi tiết hơn
+    cdc_stats = {'success': 0, 'errors': 0}
+    logger.info(f"Bắt đầu ghi CDC cho {len(records)} records")
+    
     for record in records:
         job_id = record['job_id']
-        # Đơn giản hóa: coi tất cả là insert
+        if not job_id:
+            logger.warning(f"Record không có job_id, bỏ qua CDC")
+            cdc_stats['errors'] += 1
+            continue
+            
+        # Xác định hành động: insert cho bản ghi mới, update cho bản ghi đã tồn tại
+        is_new = job_id in [str(id) for id in records[:inserted]]  # Giả sử inserted records là các bản ghi mới
+        action = 'insert' if is_new else 'update'
+        
         try:
-            save_cdc_record(job_id, 'insert', record)
+            # Ghi CDC record cho mỗi bản ghi
+            success = save_cdc_record(job_id, action, record)
+            if success:
+                cdc_stats['success'] += 1
+                logger.debug(f"Đã lưu CDC record cho job {job_id}, action={action}")
+            else:
+                cdc_stats['errors'] += 1
+                logger.warning(f"Không thể lưu CDC record cho job {job_id}, action={action}")
         except Exception as e:
-            logger.warning(f"Không thể lưu CDC record cho job {job_id}: {str(e)}")
+            cdc_stats['errors'] += 1
+            logger.error(f"Lỗi khi lưu CDC record cho job {job_id}: {str(e)}")
     
+    logger.info(f"Kết quả CDC: {cdc_stats['success']} thành công, {cdc_stats['errors']} lỗi")
     logger.info(f"Ingestion completed: {inserted} inserted, {updated} updated, {errors} errors")
-    return {'inserted': inserted, 'updated': updated, 'errors': errors}
+    
+    result = {
+        'inserted': inserted, 
+        'updated': updated, 
+        'errors': errors,
+        'cdc_success': cdc_stats['success'],
+        'cdc_errors': cdc_stats['errors']
+    }
+    
+    return result
 
 def ingest_dataframe(df: pd.DataFrame) -> Dict[str, int]:
     """Main function to ingest DataFrame into database"""
@@ -97,6 +133,7 @@ def ingest_dataframe(df: pd.DataFrame) -> Dict[str, int]:
     # Perform bulk upsert
     return bulk_upsert_jobs(df)
 
+@retry(max_tries=3, delay_seconds=1.0, logger=logger, exceptions=[IOError, json.JSONDecodeError])
 def replay_cdc_records(cdc_file_path: str) -> Dict[str, int]:
     """Replay CDC records from a file"""
     logger.info(f"Replaying CDC file: {cdc_file_path}")
@@ -109,31 +146,34 @@ def replay_cdc_records(cdc_file_path: str) -> Dict[str, int]:
     records_to_process = []
     
     # Đọc records từ file CDC
-    with open(cdc_file_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                record = json.loads(line.strip())
-                stats['processed'] += 1
+    try:
+        with open(cdc_file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    record = json.loads(line.strip())
+                    stats['processed'] += 1
+                    
+                    # Kiểm tra xem record có hợp lệ không
+                    if 'job_id' not in record.get('data', {}) or 'action' not in record:
+                        logger.warning(f"CDC record không hợp lệ ở dòng {line_num}, bỏ qua")
+                        stats['error'] += 1
+                        continue
                 
-                # Kiểm tra xem record có hợp lệ không
-                if 'job_id' not in record.get('data', {}) or 'action' not in record:
-                    logger.warning(f"CDC record không hợp lệ ở dòng {line_num}, bỏ qua")
+                    # Lấy dữ liệu và action
+                    job_id = record['data']['job_id']
+                    action = record['action']
+                    timestamp = record.get('timestamp')
+                    
+                    logger.info(f"Đang xử lý CDC record dòng {line_num}, job_id={job_id}, action={action}, time={timestamp}")
+                
+                    # Thêm vào danh sách để xử lý batch
+                    records_to_process.append(record['data'])
+                except Exception as e:
+                    logger.error(f"Lỗi xử lý dòng {line_num} trong CDC file: {str(e)}")
                     stats['error'] += 1
-                    continue
-                
-                # Lấy dữ liệu và action
-                job_id = record['data']['job_id']
-                action = record['action']
-                timestamp = record.get('timestamp')
-                
-                logger.info(f"Đang xử lý CDC record dòng {line_num}, job_id={job_id}, action={action}, time={timestamp}")
-                
-                # Thêm vào danh sách để xử lý batch
-                records_to_process.append(record['data'])
-                
-            except Exception as e:
-                logger.error(f"Lỗi xử lý dòng {line_num} trong CDC file: {str(e)}")
-                stats['error'] += 1
+    except Exception as e:
+        logger.error(f"Lỗi khi đọc CDC file: {str(e)}")
+        return {'processed': 0, 'success': 0, 'error': 1}
     
     # Xử lý các records đã đọc được
     if records_to_process:
@@ -145,7 +185,7 @@ def replay_cdc_records(cdc_file_path: str) -> Dict[str, int]:
         except Exception as e:
             logger.error(f"Lỗi khi replay CDC records: {str(e)}")
             stats['error'] += len(records_to_process)
-    
+            
     logger.info(f"CDC replay completed: {stats['processed']} records processed, " 
                 f"{stats['success']} successful, {stats['error']} errors")
     return stats
@@ -177,7 +217,20 @@ def list_cdc_files(days_back: int = 7) -> List[str]:
     
     return sorted(result)
 
+def check_cdc_dir_exists():
+    """Kiểm tra và đảm bảo thư mục CDC tồn tại"""
+    # Đảm bảo thư mục CDC tồn tại
+    cdc_dir_exists = os.path.exists(CDC_DIR)
+    if not cdc_dir_exists:
+        logger.warning(f"Thư mục CDC không tồn tại: {CDC_DIR}, đang tạo...")
+        ensure_dir(CDC_DIR)
+        return False
+    return True
+
 if __name__ == "__main__":
+    # Kiểm tra thư mục CDC
+    check_cdc_dir_exists()
+    
     # Test ingestion
     test_data = {
         'job_id': ['test001', 'test002'],

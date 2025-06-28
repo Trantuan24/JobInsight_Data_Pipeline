@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import duckdb
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -26,7 +27,9 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 logger = logging.getLogger(__name__)
 
 from src.utils.config import DUCKDB_PATH, DWH_STAGING_SCHEMA
+from src.common.decorators import retry
 
+@retry(max_tries=3, delay_seconds=1, backoff_factor=2, exceptions=(duckdb.Error,))
 def get_duckdb_connection(duckdb_path: str = DUCKDB_PATH) -> duckdb.DuckDBPyConnection:
     """ 
     Kết nối đến DuckDB 
@@ -49,6 +52,7 @@ def get_duckdb_connection(duckdb_path: str = DUCKDB_PATH) -> duckdb.DuckDBPyConn
     
     return duckdb.connect(duckdb_path)
 
+@retry(max_tries=2, delay_seconds=1, backoff_factor=2, exceptions=(Exception,))
 def execute_sql_file_duckdb(sql_file_path: str, conn=None) -> bool:
     """
     Thực thi file SQL trên DuckDB
@@ -79,7 +83,7 @@ def execute_sql_file_duckdb(sql_file_path: str, conn=None) -> bool:
         return True
     except Exception as e:
         logger.error(f"Lỗi khi thực thi file SQL {sql_file_path}: {str(e)}")
-        return False
+        raise
 
 def setup_duckdb_schema() -> bool:
     """
@@ -168,7 +172,7 @@ def batch_insert_records(
         table_name: Tên bảng
         records: List các records cần insert
         batch_size: Kích thước batch
-        on_conflict: Xử lý conflict (e.g., "DO NOTHING")
+        on_conflict: Xử lý conflict (e.g., "ON CONFLICT (column) DO NOTHING")
         
     Returns:
         int: Số bản ghi đã insert thành công
@@ -177,10 +181,13 @@ def batch_insert_records(
         return 0
         
     inserted_count = 0
+    error_count = 0
+    max_errors = 5  # Số lỗi tối đa cho phép trước khi dừng
     
     # Chia records thành các batch
     for i in range(0, len(records), batch_size):
         batch = records[i:i + batch_size]
+        current_batch_size = len(batch)
         
         try:
             # Chuẩn bị dữ liệu batch
@@ -198,12 +205,34 @@ def batch_insert_records(
             else:
                 duck_conn.execute(f"INSERT INTO {table_name} SELECT * FROM df_batch")
                 
-            inserted_count += len(batch)
+            inserted_count += current_batch_size
             
         except Exception as e:
             logger.warning(f"Lỗi khi batch insert vào {table_name}: {e}")
+            
+            # Kiểm tra xem có phải lỗi unique constraint không
+            is_unique_constraint = "unique constraint" in str(e).lower() or "duplicate key" in str(e).lower()
+            
+            # Nếu là lỗi unique constraint và có on_conflict, thử lại với cú pháp khác
+            if is_unique_constraint and on_conflict and "ON CONFLICT" in on_conflict.upper():
+                try:
+                    logger.info(f"Thử lại với cú pháp DuckDB khác...")
+                    # DuckDB có thể sử dụng cú pháp khác nhau tùy phiên bản
+                    if "DO NOTHING" in on_conflict.upper():
+                        # Thử với OR IGNORE
+                        duck_conn.execute(f"INSERT OR IGNORE INTO {table_name} SELECT * FROM df_batch")
+                        inserted_count += current_batch_size
+                        continue
+                except Exception as e2:
+                    logger.warning(f"Thử lại batch insert không thành công: {e2}")
+            
             # Fallback: insert từng record
+            fallback_inserted = 0
             for record in batch:
+                if error_count >= max_errors:
+                    logger.error(f"Đã đạt giới hạn lỗi ({max_errors}), dừng insert")
+                    break
+                
                 try:
                     columns = list(record.keys())
                     placeholders = ', '.join(['?'] * len(columns))
@@ -224,9 +253,23 @@ def batch_insert_records(
                         query += f" {on_conflict}"
                         
                     duck_conn.execute(query, values)
-                    inserted_count += 1
+                    fallback_inserted += 1
                 except Exception as e2:
-                    logger.error(f"Lỗi khi insert single record vào {table_name}: {e2}")
+                    error_count += 1
+                    if error_count < max_errors:
+                        logger.error(f"Lỗi khi insert single record vào {table_name}: {e2}")
+                    elif error_count == max_errors:
+                        logger.error(f"Đã đạt giới hạn lỗi ({max_errors}), sẽ không log thêm lỗi insert")
+            
+            inserted_count += fallback_inserted
+            
+            if fallback_inserted > 0:
+                logger.info(f"Đã fallback insert {fallback_inserted}/{current_batch_size} records vào {table_name}")
+            
+            # Nếu đã đạt giới hạn lỗi, dừng xử lý
+            if error_count >= max_errors:
+                logger.error(f"Đã đạt giới hạn lỗi ({max_errors}), dừng batch insert")
+                break
     
     # Thay đổi mức độ log từ INFO xuống DEBUG
     if inserted_count > 0:
@@ -237,6 +280,7 @@ def batch_insert_records(
     
     return inserted_count
 
+@retry(max_tries=3, delay_seconds=1, backoff_factor=2, exceptions=(Exception,))
 def lookup_dimension_key(
     duck_conn: duckdb.DuckDBPyConnection,
     dim_table: str,
@@ -272,8 +316,9 @@ def lookup_dimension_key(
         return None
     except Exception as e:
         logger.error(f"Lỗi khi tìm khóa trong {dim_table}: {e}")
-        return None
+        raise
 
+@retry(max_tries=3, delay_seconds=1, backoff_factor=2, exceptions=(Exception,))
 def lookup_location_key(
     duck_conn: duckdb.DuckDBPyConnection,
     province: str = None,
@@ -328,7 +373,7 @@ def lookup_location_key(
         return None
     except Exception as e:
         logger.error(f"Lỗi khi tìm location_sk: {e}")
-        return None
+        raise
 
 def reset_sequences(duck_conn: duckdb.DuckDBPyConnection) -> Dict[str, int]:
     """

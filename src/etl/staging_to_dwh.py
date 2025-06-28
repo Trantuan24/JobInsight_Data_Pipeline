@@ -22,7 +22,6 @@ import pyarrow.parquet as pq
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-sys.path.insert(0, PROJECT_ROOT)
 
 # Đảm bảo thư mục logs tồn tại
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")

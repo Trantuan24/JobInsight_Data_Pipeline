@@ -1,25 +1,34 @@
 import os
 from pathlib import Path
+import sys
+
+# Thêm đường dẫn gốc dự án vào sys.path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '../..'))
+
+# Import cấu hình trung tâm
+try:
+    from src.utils.config import (
+        BACKUP_DIR, CRAWLER_CONFIG, get_config
+    )
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    from src.utils.config import (
+        BACKUP_DIR, CRAWLER_CONFIG, get_config
+    )
 
 # Tạo thư mục logs nếu cần
 os.makedirs('logs', exist_ok=True)
 
-# Crawler configuration
-BASE_URL = "https://www.topcv.vn/viec-lam-it"
-
-# Backup directory
-BACKUP_DIR = Path("raw_backup")
-BACKUP_DIR.mkdir(exist_ok=True)
-
-# Timing settings
-MIN_DELAY_BETWEEN_PAGES = 4  # seconds
-MAX_DELAY_BETWEEN_PAGES = 8  # seconds
-PAGE_LOAD_TIMEOUT = 60000    # 60 seconds
-SELECTOR_TIMEOUT = 20000     # 20 seconds
-
-# Retry settings
-MAX_RETRY = 3
-RETRY_DELAYS = [2, 4, 8]  # Backoff delays in seconds
+# Cấu hình crawler từ cấu hình trung tâm
+BASE_URL = get_config('crawler', 'base_url', "https://www.topcv.vn/viec-lam-it")
+MIN_DELAY_BETWEEN_PAGES = get_config('crawler', 'min_delay', 4)
+MAX_DELAY_BETWEEN_PAGES = get_config('crawler', 'max_delay', 8)
+PAGE_LOAD_TIMEOUT = get_config('crawler', 'page_load_timeout', 60000)
+SELECTOR_TIMEOUT = get_config('crawler', 'selector_timeout', 20000)
+MAX_RETRY = get_config('crawler', 'max_retry', 3)
+RETRY_DELAYS = get_config('crawler', 'retry_delays', [2, 4, 8])
 
 # User Agents Pool (70% Desktop, 30% Mobile)
 USER_AGENTS = [

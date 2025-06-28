@@ -7,8 +7,23 @@ import os
 from pathlib import Path
 import datetime
 
-from src.utils.config import LOGS_DIR, LOG_LEVEL
-LOGS_DIR = Path("/opt/airflow/logs")
+try:
+    from src.utils.config import Config
+except ImportError:
+    # Fallback config
+    from src.utils.config import LOGS_DIR, LOG_LEVEL
+    
+# Fallback nếu cả hai đều không import được
+try:
+    logs_dir = Config.Dirs.LOGS_DIR
+    log_level = Config.Logging.LEVEL
+except (NameError, AttributeError):
+    try:
+        logs_dir = LOGS_DIR
+        log_level = LOG_LEVEL
+    except NameError:
+        logs_dir = Path("/opt/airflow/logs")
+        log_level = "INFO"
 
 def setup_logger(name="jobinsight", log_to_file=True):
     """
@@ -22,7 +37,7 @@ def setup_logger(name="jobinsight", log_to_file=True):
         logging.Logger: Configured logger
     """
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, LOG_LEVEL))
+    logger.setLevel(getattr(logging, log_level))
     
     # Create formatter
     formatter = logging.Formatter(
@@ -38,7 +53,10 @@ def setup_logger(name="jobinsight", log_to_file=True):
     # Create file handler if needed
     if log_to_file:
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        log_file = LOGS_DIR / f"{name}_{today}.log"
+        log_file = logs_dir / f"{name}_{today}.log"
+        
+        # Đảm bảo thư mục logs tồn tại
+        os.makedirs(logs_dir, exist_ok=True)
         
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)

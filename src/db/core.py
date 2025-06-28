@@ -1,95 +1,95 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Database utilities for connecting and executing queries on PostgreSQL
+Module cung cấp các hàm cơ bản để tương tác với cơ sở dữ liệu PostgreSQL.
 """
 
-import sys
-import logging
-from pathlib import Path
-import time
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine
 import pandas as pd
+import time
+from contextlib import contextmanager
+import logging
+from typing import Dict, List, Any, Optional, Union, Tuple
 
-# Thử import các module cần thiết, nếu không có thì bỏ qua
+# Import module cấu hình
 try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    from sqlalchemy import create_engine
-    from contextlib import contextmanager
-    _HAS_DB_MODULES = True
-except ImportError:
-    # Thông báo cho người dùng biết không có các module DB
-    logging.warning("Database modules (psycopg2, sqlalchemy) not found. Database functionality will be limited.")
-    _HAS_DB_MODULES = False
-
-from src.utils.logger import get_logger
-try:
+    from src.utils.logger import get_logger
     from src.utils.config import Config
 except ImportError:
-    from src.utils.config import DB_CONFIG
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    def get_logger(name):
+        return logging.getLogger(name)
+    
+    # Fallback config nếu không import được Config
+    class Config:
+        class Database:
+            @classmethod
+            def get_connection_params(cls):
+                return {
+                    "host": "localhost",
+                    "port": 5432,
+                    "user": "jobinsight",
+                    "password": "jobinsight",
+                    "database": "jobinsight",
+                    "dbname": "jobinsight"
+                }
 
-logger = get_logger("db")
+logger = get_logger("db.core")
 
-def get_connection_string():
+def get_connection_string(conn_params=None):
     """
     Tạo chuỗi kết nối PostgreSQL
     
+    Args:
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
+        
     Returns:
         str: Chuỗi kết nối
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return None
-        
-    try:
-        db_config = Config.Database.get_connection_params()
-    except (NameError, AttributeError):
-        db_config = DB_CONFIG
-        
-    return f"postgresql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+    params = conn_params or Config.Database.get_connection_params()
+    return f"postgresql://{params['user']}:{params['password']}@{params['host']}:{params['port']}/{params['database']}"
 
-def get_engine():
+def get_engine(conn_params=None):
     """
     Tạo SQLAlchemy engine để kết nối với database
     
+    Args:
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
+        
     Returns:
         sqlalchemy.engine.Engine: SQLAlchemy engine
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return None
-        
-    connection_string = get_connection_string()
+    connection_string = get_connection_string(conn_params)
     return create_engine(connection_string)
 
 @contextmanager
-def get_connection():
+def get_connection(conn_params=None):
     """
     Context manager để quản lý kết nối tới PostgreSQL
     
+    Args:
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
+        
     Yields:
         connection: Kết nối database
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        yield None
-        return
-        
     conn = None
     max_attempts = 5
     attempt = 0
     
-    try:
-        db_config = Config.Database.get_connection_params()
-    except (NameError, AttributeError):
-        db_config = DB_CONFIG
+    params = conn_params or Config.Database.get_connection_params()
     
     while attempt < max_attempts:
         try:
             conn = psycopg2.connect(
-                host=db_config["host"],
-                port=db_config["port"],
-                database=db_config["database"],
-                user=db_config["user"],
-                password=db_config["password"]
+                host=params["host"],
+                port=params["port"],
+                database=params["database"],
+                user=params["user"],
+                password=params["password"]
             )
             conn.autocommit = False
             yield conn
@@ -109,7 +109,7 @@ def get_connection():
                 conn.close()
                 logger.debug("Đã đóng kết nối DB")
 
-def execute_query(query, params=None, fetch=True):
+def execute_query(query, params=None, fetch=True, conn_params=None):
     """
     Thực thi truy vấn SQL và trả về kết quả
     
@@ -117,116 +117,79 @@ def execute_query(query, params=None, fetch=True):
         query (str): Câu truy vấn SQL
         params (tuple, dict, optional): Tham số truy vấn
         fetch (bool): Có lấy kết quả trả về hay không
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
         
     Returns:
         list: Kết quả truy vấn
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return None
-        
-    with get_connection() as conn:
+    with get_connection(conn_params) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params)
             if fetch:
                 return cursor.fetchall()
             return None
 
-def insert_dataframe(df, table_name, if_exists='append'):
-    """
-    Chèn DataFrame vào bảng PostgreSQL
-    
-    Args:
-        df (pandas.DataFrame): DataFrame cần chèn
-        table_name (str): Tên bảng
-        if_exists (str): Hành động khi bảng đã tồn tại ('append', 'replace', 'fail')
-        
-    Returns:
-        int: Số bản ghi đã chèn
-    """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return None
-        
-    try:
-        engine = get_engine()
-        result = df.to_sql(table_name, engine, if_exists=if_exists, index=False)
-        logger.info(f"Đã chèn {len(df)} bản ghi vào bảng {table_name}")
-        return result
-    except Exception as e:
-        logger.error(f"Lỗi khi chèn dữ liệu vào {table_name}: {e}")
-        raise
-
-def get_dataframe(query, params=None):
+def get_dataframe(query, params=None, conn_params=None):
     """
     Thực thi truy vấn SQL và trả về DataFrame
     
     Args:
         query (str): Câu truy vấn SQL
         params (tuple, dict, optional): Tham số truy vấn
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
         
     Returns:
         pandas.DataFrame: Kết quả truy vấn dạng DataFrame
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return pd.DataFrame()
-        
     try:
-        engine = get_engine()
+        engine = get_engine(conn_params)
         return pd.read_sql(query, engine, params=params)
     except Exception as e:
         logger.error(f"Lỗi khi truy vấn dữ liệu: {e}")
         raise
 
-def table_exists(table_name, schema='public'):
+def table_exists(table_name, schema='public', conn_params=None):
     """
     Kiểm tra bảng có tồn tại trong database không
     
     Args:
         table_name (str): Tên bảng
         schema (str): Schema chứa bảng
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
         
     Returns:
         bool: True nếu bảng tồn tại, False nếu không
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return False
-        
     query = """
     SELECT EXISTS (
         SELECT FROM information_schema.tables 
         WHERE table_schema = %s AND table_name = %s
     );
     """
-    with get_connection() as conn:
+    with get_connection(conn_params) as conn:
         with conn.cursor() as cursor:
             cursor.execute(query, (schema, table_name))
             return cursor.fetchone()[0]
 
-def execute_stored_procedure(procedure_name, params=None):
+def execute_stored_procedure(procedure_name, params=None, conn_params=None):
     """
     Thực thi stored procedure
     
     Args:
         procedure_name (str): Tên stored procedure
         params (tuple, optional): Tham số procedure
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
         
     Returns:
         list: Kết quả từ procedure nếu có
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return None
-        
     call_statement = f"CALL {procedure_name}("
     if params:
         placeholders = ", ".join(["%s"] * len(params))
         call_statement += placeholders
     call_statement += ");"
     
-    with get_connection() as conn:
+    with get_connection(conn_params) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(call_statement, params)
             try:
@@ -235,28 +198,23 @@ def execute_stored_procedure(procedure_name, params=None):
                 # Procedure không trả về kết quả
                 return None
 
-# Hàm tiện ích
-def execute_sql_file(sql_file_path):
+def execute_sql_file(sql_file_path, conn_params=None):
     """
     Thực thi file SQL
     
     Args:
         sql_file_path (str): Đường dẫn đến file SQL cần thực thi
+        conn_params: Tham số kết nối, nếu None sẽ lấy từ Config
         
     Returns:
         bool: True nếu thành công, False nếu thất bại
     """
-    if not _HAS_DB_MODULES:
-        logger.error("Database modules not available")
-        return False
-        
     try:
         with open(sql_file_path, 'r', encoding='utf-8') as f:
             sql_script = f.read()
         
         # Thực thi toàn bộ file SQL như một khối lệnh duy nhất
-        # thay vì cắt theo dấu chấm phẩy
-        with get_connection() as conn:
+        with get_connection(conn_params) as conn:
             with conn.cursor() as cursor:
                 try:
                     cursor.execute(sql_script)
@@ -272,5 +230,4 @@ def execute_sql_file(sql_file_path):
     except Exception as e:
         logger.error(f"Lỗi khi thực thi file SQL {sql_file_path}: {str(e)}")
         logger.error(f"Chi tiết lỗi: {type(e).__name__}: {str(e)}")
-        return False
-    
+        return False 

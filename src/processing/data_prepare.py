@@ -55,6 +55,13 @@ def prepare_dim_job(staging_records: pd.DataFrame) -> pd.DataFrame:
     dim_job_df['expiry_date'] = None
     dim_job_df['is_current'] = True
     
+    # Thêm cột job_sk trống để đủ 10 cột theo schema
+    # Schema: job_sk, job_id, title_clean, job_url, skills, last_update, logo_url, effective_date, expiry_date, is_current
+    dim_job_df['job_sk'] = None
+    
+    # Sắp xếp lại các cột theo đúng thứ tự trong schema
+    dim_job_df = dim_job_df[['job_sk', 'job_id', 'title_clean', 'job_url', 'skills', 'last_update', 'logo_url', 'effective_date', 'expiry_date', 'is_current']]
+    
     logger.info(f"Đã chuẩn bị {len(dim_job_df)} bản ghi DimJob")
     return dim_job_df
 
@@ -85,6 +92,13 @@ def prepare_dim_company(staging_records: pd.DataFrame) -> pd.DataFrame:
     
     # Loại bỏ duplicate
     company_df = company_df.drop(columns=['company_name']).drop_duplicates(subset=['company_name_standardized'])
+    
+    # Thêm cột company_sk trống để đủ 7 cột theo schema
+    # Schema: company_sk, company_name_standardized, company_url, verified_employer, effective_date, expiry_date, is_current
+    company_df['company_sk'] = None
+    
+    # Sắp xếp lại các cột theo đúng thứ tự trong schema
+    company_df = company_df[['company_sk', 'company_name_standardized', 'company_url', 'verified_employer', 'effective_date', 'expiry_date', 'is_current']]
     
     logger.info(f"Đã chuẩn bị {len(company_df)} bản ghi DimCompany")
     return company_df
@@ -407,6 +421,13 @@ def prepare_dim_location(staging_records: pd.DataFrame) -> pd.DataFrame:
     
     # Loại bỏ duplicate dựa trên (province, city, district)
     location_df = location_df.drop_duplicates(subset=['province', 'city', 'district'], keep='first')
+    
+    # Thêm cột location_sk trống để đủ 7 cột theo schema
+    # Schema: location_sk, province, city, district, effective_date, expiry_date, is_current
+    location_df['location_sk'] = None
+    
+    # Sắp xếp lại các cột theo đúng thứ tự trong schema
+    location_df = location_df[['location_sk', 'province', 'city', 'district', 'effective_date', 'expiry_date', 'is_current']]
     
     logger.info(f"Đã chuẩn bị {len(location_df)} bản ghi DimLocation unique")
     

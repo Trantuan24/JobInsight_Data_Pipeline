@@ -6,9 +6,6 @@ from typing import Dict, Any, Optional
 import os
 import sys
 
-# Thêm đường dẫn gốc dự án vào sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 # Import modules
 try:
     from src.utils.logger import get_logger

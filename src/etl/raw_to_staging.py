@@ -24,7 +24,6 @@ from bs4 import BeautifulSoup
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-sys.path.insert(0, PROJECT_ROOT)
 
 # Đảm bảo thư mục logs tồn tại
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
@@ -42,20 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import modules từ utils
-try:
-    from src.utils.config import DB_CONFIG, RAW_JOBS_TABLE, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE, RAW_BATCH_SIZE
-    from src.utils.db import get_connection, execute_query, table_exists, get_dataframe, execute_stored_procedure, execute_sql_file
-except ImportError as e:
-    # Thử cách thay thế
-    sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
-    from utils.config import DB_CONFIG, RAW_JOBS_TABLE, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE, RAW_BATCH_SIZE
-    from utils.db import get_connection, execute_query, table_exists, get_dataframe, execute_stored_procedure, execute_sql_file
-
-# from data_processing import clean_title, clean_company_name, extract_location_info, refine_location
-try:
-    from src.processing.data_processing import clean_title, clean_company_name, extract_location_info, refine_location
-except ImportError:
-    from processing.data_processing import clean_title, clean_company_name, extract_location_info, refine_location
+from src.utils.config import DB_CONFIG, RAW_JOBS_TABLE, DWH_STAGING_SCHEMA, STAGING_JOBS_TABLE, RAW_BATCH_SIZE
+from src.utils.db import get_connection, execute_query, table_exists, get_dataframe, execute_stored_procedure, execute_sql_file
+from src.processing.data_processing import clean_title, clean_company_name, extract_location_info, refine_location
 
 # Đường dẫn đến thư mục SQL
 SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
@@ -174,13 +162,14 @@ def run_stored_procedures():
         logger.error(f"Lỗi khi thực thi stored procedures: {e}")
         return False
 
-def load_staging_data(limit=None, offset=0):
+def load_staging_data(limit=None, offset=0, query_filter=None):
     """
     Load dữ liệu từ bảng staging_jobs vào DataFrame
     
     Args:
         limit: Giới hạn số bản ghi cần lấy
         offset: Vị trí bắt đầu
+        query_filter: Điều kiện WHERE để lọc dữ liệu
         
     Returns:
         DataFrame chứa dữ liệu từ staging_jobs
@@ -192,6 +181,12 @@ def load_staging_data(limit=None, offset=0):
         
         # Xây dựng query
         query = f"SELECT * FROM {table_name}"
+        
+        # Thêm điều kiện lọc nếu có
+        if query_filter:
+            query += f" {query_filter}"
+            
+        # Thêm limit và offset
         if limit is not None:
             query += f" LIMIT {limit}"
         if offset > 0:
@@ -327,21 +322,32 @@ def verify_etl_integrity(source_count, target_count, threshold=0.98):
         
     return True
 
-def run_etl():
+def run_etl(batch_size=None, only_unprocessed=False, verbose=False):
     """
     Thực hiện quy trình ETL hoàn chỉnh
     
+    Args:
+        batch_size (int, optional): Số bản ghi xử lý mỗi batch, mặc định là None (xử lý tất cả)
+        only_unprocessed (bool, optional): Chỉ xử lý các bản ghi chưa được xử lý, mặc định là False
+        verbose (bool, optional): Hiển thị thêm thông tin chi tiết, mặc định là False
+    
     Returns:
-        bool: Kết quả thực hiện
+        dict: Kết quả thực hiện với các thông tin chi tiết
     """
     try:
-        logger.info("Bắt đầu ETL từ raw_jobs sang staging_jobs...")
+        # Thiết lập logging level nếu verbose
+        if verbose:
+            logger.setLevel(logging.DEBUG)
+            for handler in logger.handlers:
+                handler.setLevel(logging.DEBUG)
+        
+        logger.info(f"Bắt đầu ETL từ raw_jobs sang staging_jobs (batch_size={batch_size}, only_unprocessed={only_unprocessed})...")
         start_time = datetime.now()
         
         # 1. Thiết lập schema và bảng nếu cần
         if not setup_database_schema():
             logger.error("Không thể thiết lập schema và bảng!")
-            return False
+            return {"success": False, "error": "Không thể thiết lập schema và bảng!"}
         
         # 2. Chạy stored procedures để xử lý dữ liệu cơ bản
         if not run_stored_procedures():
@@ -350,12 +356,29 @@ def run_etl():
         
         # 3. Load dữ liệu từ staging để xử lý thêm bằng pandas
         try:
-            staging_df = load_staging_data()
+            # Nếu only_unprocessed là True, chỉ lấy các bản ghi chưa được xử lý
+            query_filter = None
+            if only_unprocessed:
+                query_filter = "WHERE processed IS NULL OR processed = FALSE"
+                
+            staging_df = load_staging_data(limit=batch_size, query_filter=query_filter)
             source_count = len(staging_df)
             
             if source_count == 0:
                 logger.warning("Không có dữ liệu trong bảng staging_jobs để xử lý!")
-                return True  # Không có dữ liệu vẫn coi là thành công
+                return {
+                    "success": True,
+                    "message": "Không có dữ liệu để xử lý",
+                    "stats": {
+                        "total_records": 0,
+                        "processed_records": 0,
+                        "success_count": 0,
+                        "failure_count": 0,
+                        "success_rate": 100.0,
+                        "duration_seconds": (datetime.now() - start_time).total_seconds(),
+                        "batch_count": 0
+                    }
+                }
                 
             # 4. Xử lý chi tiết bằng pandas
             processed_df = process_staging_data(staging_df)
@@ -369,29 +392,50 @@ def run_etl():
             # 5. Lưu kết quả trở lại bảng staging
             if not save_back_to_staging(processed_df):
                 logger.error("Không thể lưu kết quả vào bảng staging!")
-                return False
+                return {
+                    "success": False,
+                    "error": "Không thể lưu kết quả vào bảng staging",
+                    "stats": {
+                        "total_records": source_count,
+                        "processed_records": processed_count,
+                        "duration_seconds": (datetime.now() - start_time).total_seconds()
+                    }
+                }
         except Exception as e:
             logger.error(f"Lỗi khi xử lý dữ liệu staging: {e}")
-            return False
+            return {
+                "success": False,
+                "error": f"Lỗi khi xử lý dữ liệu staging: {str(e)}"
+            }
         
         # Tính thời gian chạy
         duration = (datetime.now() - start_time).total_seconds()
         
         # Thống kê ETL
         etl_stats = {
-            "source_count": source_count,
-            "processed_count": processed_count,
+            "total_records": source_count,
+            "processed_records": processed_count,
+            "success_count": processed_count,  # Giả sử tất cả đều thành công
+            "failure_count": source_count - processed_count,
             "success_rate": processed_count / max(1, source_count) * 100,
-            "duration_seconds": duration
+            "duration_seconds": duration,
+            "batch_count": 1  # Mặc định là 1 batch
         }
         
         logger.info(f"Quy trình ETL đã hoàn thành thành công trong {duration:.2f} giây!")
         logger.info(f"Thống kê ETL: {json.dumps(etl_stats)}")
         
-        return True
+        return {
+            "success": True,
+            "message": "ETL raw_to_staging hoàn thành thành công",
+            "stats": etl_stats
+        }
     except Exception as e:
         logger.error(f"Lỗi trong quy trình ETL: {e}")
-        return False
+        return {
+            "success": False,
+            "error": f"Lỗi trong quy trình ETL: {str(e)}"
+        }
 
 # Hàm main
 if __name__ == "__main__":

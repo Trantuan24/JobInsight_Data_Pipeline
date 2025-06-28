@@ -304,8 +304,7 @@ if __name__ == "__main__":
     # Add project root to path
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
     PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
-    sys.path.insert(0, PROJECT_ROOT)
-    
+        
     from src.utils.config import DUCKDB_PATH
     
     # Connect and validate
