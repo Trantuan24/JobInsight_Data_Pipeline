@@ -258,18 +258,19 @@ cleanup_params = {
 ```mermaid
 timeline
     title Daily ETL Schedule
-    
-    11:00 UTC : crawl_topcv_jobs starts
-              : HTML backup (15-20s)
-              : Data parsing (10-15s)
-              : Database ingestion (10-15s)
-              : CDC cleanup (2-5s)
-    
-    11:01 UTC : crawl_topcv_jobs completes
-    
-    11:30 UTC : jobinsight_etl_pipeline starts
-              : Waits for crawl_topcv_jobs completion
-              : Processes raw_jobs → staging → DWH
+
+    section 11:00 UTC
+        crawl_topcv_jobs starts    : HTML backup (15-20s)
+                                   : Data parsing (10-15s)
+                                   : Database ingestion (10-15s)
+                                   : CDC cleanup (2-5s)
+
+    section 11:01 UTC
+        crawl_topcv_jobs completes : Task completion
+
+    section 11:30 UTC
+        jobinsight_etl_pipeline starts : Waits for crawl_topcv_jobs completion
+                                       : Processes raw_jobs → staging → DWH
 ```
 
 ### Retry Configuration
