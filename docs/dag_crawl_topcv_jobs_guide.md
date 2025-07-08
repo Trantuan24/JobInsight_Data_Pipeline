@@ -256,21 +256,22 @@ cleanup_params = {
 
 ### Integration with ETL Pipeline
 ```mermaid
-timeline
-    title Daily ETL Schedule
+flowchart TD
+    A["🕐 11:00 UTC<br/>crawl_topcv_jobs starts"] --> B["HTML backup<br/>(15-20s)"]
+    B --> C["Data parsing<br/>(10-15s)"]
+    C --> D["Database ingestion<br/>(10-15s)"]
+    D --> E["CDC cleanup<br/>(2-5s)"]
+    E --> F["🕐 11:01 UTC<br/>crawl_topcv_jobs completes"]
 
-    section 11:00 UTC
-        crawl_topcv_jobs starts    : HTML backup (15-20s)
-                                   : Data parsing (10-15s)
-                                   : Database ingestion (10-15s)
-                                   : CDC cleanup (2-5s)
+    F --> G["⏳ Wait 29 minutes"]
+    G --> H["🕐 11:30 UTC<br/>jobinsight_etl_pipeline starts"]
+    H --> I["Wait for crawl completion<br/>(ExternalTaskSensor)"]
+    I --> J["Process raw_jobs → staging → DWH"]
 
-    section 11:01 UTC
-        crawl_topcv_jobs completes : Task completion
-
-    section 11:30 UTC
-        jobinsight_etl_pipeline starts : Waits for crawl_topcv_jobs completion
-                                       : Processes raw_jobs → staging → DWH
+    style A fill:#e1f5fe
+    style F fill:#c8e6c9
+    style H fill:#fff3e0
+    style J fill:#f3e5f5
 ```
 
 ### Retry Configuration
