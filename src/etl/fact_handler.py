@@ -6,16 +6,9 @@ Module xử lý fact tables và bridge tables
 """
 import pandas as pd
 import logging
-import json
-import os
-import sys
 import duckdb
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
-
-# Thiết lập đường dẫn và logging
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
 
 # Thiết lập logging
 logger = logging.getLogger(__name__)
@@ -114,25 +107,20 @@ class FactHandler:
             cache_key = f"{loc['province'] or 'None'}:{loc['city']}:{loc['district'] or 'None'}"
             location_cache[cache_key] = loc['location_sk']
         
-        # Tạo các fact records và bridge records
-        for _, job in staging_df.iterrows():
-            # Lấy surrogate keys
-            job_id = str(job['job_id'])
-            job_sk = job_id_to_sk.get(job_id)
-            
-            company_name = job['company_name_standardized']
-            company_sk = company_to_sk.get(company_name)
-            
-            # Kiểm tra xem job và company có tồn tại trong dimension tables không
-            if not job_sk:
-                logger.warning(f"Job ID {job_id} không tồn tại trong DimJob, bỏ qua...")
-                job_skipped += 1
-                continue
-                
-            if not company_sk:
-                logger.warning(f"Company {company_name} không tồn tại trong DimCompany, bỏ qua...")
-                job_skipped += 1
-                continue
+        # OPTIMIZED: Vectorized operations instead of iterrows()
+        # Map surrogate keys using vectorized operations
+        staging_df['job_sk'] = staging_df['job_id'].astype(str).map(job_id_to_sk)
+        staging_df['company_sk'] = staging_df['company_name_standardized'].map(company_to_sk)
+
+        # Filter out records without valid surrogate keys
+        valid_records = staging_df.dropna(subset=['job_sk', 'company_sk'])
+        job_skipped = len(staging_df) - len(valid_records)
+
+        if job_skipped > 0:
+            logger.warning(f"Bỏ qua {job_skipped} records do thiếu job_sk hoặc company_sk")
+
+        # Process valid records in batches
+        for _, job in valid_records.iterrows():
                 
             # Parse posted_time và due_date
             posted_time = None
@@ -149,35 +137,194 @@ class FactHandler:
                 except:
                     pass
                     
-            # Tạo fact records cho mỗi ngày trong khoảng hiển thị
-            for date_id in dates_to_create:
-                # Xử lý một fact record
-                fact_id = self._process_single_fact_record(
-                    job, job_sk, company_sk, date_id, due_date, 
-                    posted_time, crawled_at, load_month
-                )
+            # OPTIMIZED: Batch process fact records for all dates
+            job_sk = int(job['job_sk'])
+            company_sk = int(job['company_sk'])
+
+            # Parse dates once
+            posted_time = None
+            if pd.notna(job.get('posted_time')):
+                try:
+                    posted_time = pd.to_datetime(job['posted_time'])
+                except:
+                    pass
+
+            due_date = None
+            if pd.notna(job.get('due_date')):
+                try:
+                    due_date = pd.to_datetime(job['due_date'])
+                except:
+                    pass
+
+            # Batch create fact records for all dates
+            batch_fact_records = self._batch_create_fact_records(
+                job, job_sk, company_sk, dates_to_create,
+                due_date, posted_time, crawled_at, load_month
+            )
+
+            # Process successful fact records
+            for fact_record in batch_fact_records:
+                fact_records.append(fact_record)
+
+                # Process location bridges for this fact
+                bridges = self._process_location_bridges(job, fact_record['fact_id'], location_cache)
+                if bridges:
+                    bridge_records.extend(bridges)
+                else:
+                    bridge_skipped += 1
                 
-                if fact_id:
-                    # Thêm vào danh sách kết quả
-                    fact_records.append({
-                        'fact_id': fact_id,
-                        'job_sk': job_sk,
-                        'company_sk': company_sk,
-                        'date_id': date_id
-                    })
-                    
-                    # Xử lý location bridges
-                    bridges = self._process_location_bridges(job, fact_id, location_cache)
-                    if bridges:
-                        bridge_records.extend(bridges)
-                    else:
-                        bridge_skipped += 1
-                
-        logger.info(f"Đã tạo {len(fact_records)} fact records và {len(bridge_records)} bridge records")
-        logger.info(f"Đã bỏ qua {job_skipped} jobs và {bridge_skipped} bridges")
+        # Enhanced summary logging
+        logger.info(f"📊 FACT GENERATION SUMMARY:")
+        logger.info(f"  - Input staging records: {len(staging_df)}")
+        logger.info(f"  - Valid records (with job_sk & company_sk): {len(valid_records)}")
+        logger.info(f"  - Expected fact records (valid × 5 dates): {len(valid_records) * 5}")
+        logger.info(f"  - Actually created fact records: {len(fact_records)}")
+        logger.info(f"  - Created bridge records: {len(bridge_records)}")
+        logger.info(f"  - Skipped jobs: {job_skipped}")
+        logger.info(f"  - Skipped bridges: {bridge_skipped}")
+
+        # Calculate success rate
+        expected_facts = len(valid_records) * 5
+        success_rate = (len(fact_records) / expected_facts * 100) if expected_facts > 0 else 0
+        logger.info(f"  - Success rate: {success_rate:.1f}% ({len(fact_records)}/{expected_facts})")
+
+        if len(fact_records) == 0 and expected_facts > 0:
+            logger.warning("🚨 ZERO FACT RECORDS CREATED - This indicates a critical issue!")
+        elif success_rate < 95.0:  # Only warn if success rate < 95%
+            logger.warning(f"⚠️ LOW SUCCESS RATE - Created {len(fact_records)}/{expected_facts} expected records ({success_rate:.1f}%)")
+        elif len(fact_records) < expected_facts:
+            logger.info(f"ℹ️ MINOR GAPS - Created {len(fact_records)}/{expected_facts} expected records ({success_rate:.1f}%) - within acceptable range")
         
         return fact_records, bridge_records
-    
+
+    def _batch_create_fact_records(
+        self,
+        job: pd.Series,
+        job_sk: int,
+        company_sk: int,
+        dates_to_create: List[datetime],
+        due_date: Optional[datetime],
+        posted_time: Optional[datetime],
+        crawled_at: datetime,
+        load_month: str
+    ) -> List[Dict]:
+        """
+        Batch create fact records for multiple dates - OPTIMIZED
+
+        Returns:
+            List of successfully created fact records
+        """
+        batch_records = []
+
+        try:
+            # Prepare batch data
+            batch_data = []
+            for date_id in dates_to_create:
+                batch_data.append((
+                    job_sk, company_sk, date_id,
+                    job.get('salary_min') if pd.notna(job.get('salary_min')) else None,
+                    job.get('salary_max') if pd.notna(job.get('salary_max')) else None,
+                    job.get('salary_type') if pd.notna(job.get('salary_type')) else None,
+                    due_date,
+                    job.get('time_remaining') if pd.notna(job.get('time_remaining')) else None,
+                    job.get('verified_employer', False),
+                    posted_time,
+                    crawled_at,
+                    load_month
+                ))
+
+            # Batch UPSERT with RETURNING fact_id - FIXED VERSION (no load_month update)
+            upsert_query = """
+                INSERT INTO FactJobPostingDaily (
+                    job_sk, company_sk, date_id,
+                    salary_min, salary_max, salary_type,
+                    due_date, time_remaining, verified_employer,
+                    posted_time, crawled_at, load_month
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (job_sk, date_id)
+                DO UPDATE SET
+                    salary_min = EXCLUDED.salary_min,
+                    salary_max = EXCLUDED.salary_max,
+                    salary_type = EXCLUDED.salary_type,
+                    due_date = EXCLUDED.due_date,
+                    time_remaining = EXCLUDED.time_remaining,
+                    verified_employer = EXCLUDED.verified_employer,
+                    posted_time = EXCLUDED.posted_time,
+                    crawled_at = EXCLUDED.crawled_at
+                RETURNING fact_id, job_sk, company_sk, date_id
+            """
+
+            # REMOVED: Excessive debug logging - functionality is stable
+
+            # Execute batch upsert with detailed logging
+            for i, data in enumerate(batch_data):
+                try:
+                    # Check if record already exists before UPSERT
+                    check_existing = self.duck_conn.execute(
+                        "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?",
+                        [data[0], data[2]]  # job_sk, date_id
+                    ).fetchone()
+
+                    existing_fact_id = check_existing[0] if check_existing else None
+
+                    # Execute UPSERT with enhanced error handling
+                    try:
+                        result = self.duck_conn.execute(upsert_query, data).fetchone()
+                    except Exception as upsert_error:
+                        logger.error(f"🚨 UPSERT execution failed for job_sk={data[0]}, date={dates_to_create[i]}: {upsert_error}")
+                        logger.error(f"   Query: {upsert_query}")
+                        logger.error(f"   Data: {data}")
+                        continue
+
+                    # REMOVED: Excessive UPSERT logging - only log failures
+                    if not result:  # Only log failures for debugging
+                        if existing_fact_id:
+                            logger.debug(f"🔄 UPSERT UPDATE failed: job_sk={data[0]}, date={dates_to_create[i]}")
+                        else:
+                            logger.debug(f"🆕 UPSERT INSERT failed: job_sk={data[0]}, date={dates_to_create[i]}")
+
+                    # Handle result - try to get fact_id even if RETURNING is empty
+                    if result:
+                        # RETURNING worked - use returned fact_id
+                        fact_id = result[0]
+                        logger.info(f"✅ RETURNING success: fact_id={fact_id}")
+                    elif existing_fact_id:
+                        # RETURNING failed but record existed - use existing fact_id
+                        fact_id = existing_fact_id
+                        logger.info(f"🔄 Using existing fact_id: {fact_id}")
+                    else:
+                        # Neither RETURNING nor existing - query for new fact_id
+                        new_check = self.duck_conn.execute(
+                            "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?",
+                            [data[0], data[2]]
+                        ).fetchone()
+                        if new_check:
+                            fact_id = new_check[0]
+                            logger.info(f"🔍 Found new fact_id: {fact_id}")
+                        else:
+                            # ENHANCED: Better error handling for missing fact_id
+                            logger.warning(f"❌ No fact_id found after UPSERT: job_sk={data[0]}, date={dates_to_create[i]}")
+                            logger.warning(f"   UPSERT data: {data}")
+                            logger.warning(f"   This indicates a potential constraint violation or data issue")
+                            continue
+
+                    # Add to batch_records
+                    batch_records.append({
+                        'fact_id': fact_id,
+                        'job_sk': data[0],
+                        'company_sk': data[1],
+                        'date_id': dates_to_create[i]
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Failed to upsert fact record for job_sk={job_sk}, date={dates_to_create[i]}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Batch create fact records failed for job_sk={job_sk}: {e}")
+
+        return batch_records
+
     @retry(max_tries=3, delay_seconds=2, backoff_factor=2, exceptions=[Exception])
     def _process_single_fact_record(
         self,
@@ -405,11 +552,9 @@ class FactHandler:
             self.duck_conn.execute("BEGIN TRANSACTION")
             
             try:
-                # Tắt foreign key constraints nếu có thể
-                try:
-                    self.duck_conn.execute("PRAGMA foreign_keys = OFF")
-                except Exception as e:
-                    logger.warning(f"Không thể tắt foreign keys - có thể DuckDB không hỗ trợ")
+                # FIXED: DuckDB doesn't support PRAGMA foreign_keys
+                # Skip foreign key disabling as DuckDB handles constraints differently
+                logger.debug("DuckDB không cần tắt foreign keys - bỏ qua bước này")
                 
                 # Tạo bảng backup
                 logger.info("Tạo bảng backup...")
@@ -533,8 +678,8 @@ class FactHandler:
         load_month: str
     ) -> Optional[int]:
         """
-        Tạo mới một fact record
-        
+        Tạo mới một fact record với proper sequence-based fact_id
+
         Args:
             job: Bản ghi job từ staging
             job_sk: Surrogate key của job
@@ -544,149 +689,90 @@ class FactHandler:
             posted_time: Thời điểm đăng job
             crawled_at: Thời điểm crawl dữ liệu
             load_month: Tháng load dữ liệu (YYYY-MM)
-            
+
         Returns:
             fact_id nếu thành công, None nếu thất bại
         """
         try:
-            # Bắt đầu transaction
-            self.duck_conn.execute("BEGIN TRANSACTION")
-            
-            try:
-                # Kiểm tra xem đã có fact record với job_sk và date_id này chưa
-                double_check = self.duck_conn.execute(
-                    "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", 
+            # Kiểm tra xem đã có fact record với job_sk và date_id này chưa
+            double_check = self.duck_conn.execute(
+                "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?",
+                [job_sk, date_id]
+            ).fetchone()
+
+            if double_check:
+                logger.debug(f"Fact record đã tồn tại: job_sk={job_sk}, date_id={date_id}, fact_id={double_check[0]}")
+                return double_check[0]
+                
+            # FIXED: Use proper UPSERT with ON CONFLICT to handle duplicates (no load_month update)
+            upsert_query = """
+                INSERT INTO FactJobPostingDaily (
+                    job_sk, company_sk, date_id,
+                    salary_min, salary_max, salary_type,
+                    due_date, time_remaining, verified_employer,
+                    posted_time, crawled_at, load_month
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (job_sk, date_id)
+                DO UPDATE SET
+                    salary_min = EXCLUDED.salary_min,
+                    salary_max = EXCLUDED.salary_max,
+                    salary_type = EXCLUDED.salary_type,
+                    due_date = EXCLUDED.due_date,
+                    time_remaining = EXCLUDED.time_remaining,
+                    verified_employer = EXCLUDED.verified_employer,
+                    posted_time = EXCLUDED.posted_time,
+                    crawled_at = EXCLUDED.crawled_at
+                RETURNING fact_id
+            """
+
+            # REMOVED: Debug logging - functionality is stable
+
+            upsert_values = [
+                job_sk, company_sk, date_id,
+                job.salary_min if pd.notna(job.salary_min) else None,
+                job.salary_max if pd.notna(job.salary_max) else None,
+                job.salary_type if pd.notna(job.salary_type) else None,
+                due_date,
+                job.time_remaining if pd.notna(job.time_remaining) else None,
+                job.verified_employer if pd.notna(job.verified_employer) else False,
+                posted_time,
+                crawled_at,
+                load_month
+            ]
+
+            # Check if record exists before UPSERT
+            pre_check = self.duck_conn.execute(
+                "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?",
+                [job_sk, date_id]
+            ).fetchone()
+            existing_fact_id = pre_check[0] if pre_check else None
+
+            # Execute UPSERT
+            result = self.duck_conn.execute(upsert_query, upsert_values).fetchone()
+
+            # Handle UPSERT result with fallback logic
+            if result:
+                # RETURNING worked
+                fact_id = result[0]
+                logger.debug(f"✅ RETURNING success: fact_id={fact_id}, job_sk={job_sk}, date_id={date_id}")
+                return fact_id
+            elif existing_fact_id:
+                # RETURNING failed but record existed - use existing fact_id
+                logger.debug(f"🔄 Using existing fact_id: {existing_fact_id}, job_sk={job_sk}, date_id={date_id}")
+                return existing_fact_id
+            else:
+                # Query for fact_id after UPSERT
+                post_check = self.duck_conn.execute(
+                    "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?",
                     [job_sk, date_id]
                 ).fetchone()
-                
-                if double_check:
-                    # Có thể đã được tạo bởi một process khác
-                    logger.debug(f"Đã tìm thấy fact record trong lần kiểm tra thứ hai: job_sk={job_sk}, date_id={date_id}")
-                    self.duck_conn.execute("COMMIT")
-                    return double_check[0]
-                
-                # Import các module cần thiết
-                import time
-                import uuid
-                
-                # Tạo fact_id duy nhất sử dụng UUID và timestamp để đảm bảo tính duy nhất cao
-                unique_id = uuid.uuid4().int
-                timestamp_ms = int(time.time() * 1000)
-                
-                # Sử dụng một phạm vi giá trị mới cho fact_id để tránh xung đột với các giá trị cũ
-                # Bắt đầu từ 5000000 để tránh xung đột với các giá trị cũ (1000000-4999999)
-                fact_id = 5000000 + (abs(hash(f"{job_sk}_{date_id}_{uuid.uuid4()}")) + timestamp_ms) % (10**7)
-                
-                # Kiểm tra xem fact_id đã tồn tại chưa
-                check_id_query = "SELECT 1 FROM FactJobPostingDaily WHERE fact_id = ?"
-                id_exists = self.duck_conn.execute(check_id_query, [fact_id]).fetchone() is not None
-                
-                # Nếu fact_id đã tồn tại, tạo một giá trị khác
-                retry_count = 0
-                while id_exists and retry_count < 10:  # Tăng số lần retry lên 10
-                    retry_count += 1
-                    # Tạo một fact_id mới với offset khác nhau cho mỗi lần thử
-                    fact_id = 5000000 + (abs(hash(f"{job_sk}_{date_id}_{uuid.uuid4()}_{retry_count}")) + timestamp_ms + retry_count * 10000) % (10**7)
-                    id_exists = self.duck_conn.execute(check_id_query, [fact_id]).fetchone() is not None
-                
-                if id_exists:
-                    logger.warning(f"Không thể tạo fact_id duy nhất sau 10 lần thử cho job_sk={job_sk}, date_id={date_id}")
-                    self.duck_conn.execute("ROLLBACK")
-                    return None
-                
-                # Tạo fact record mới với fact_id chỉ định để tránh xung đột
-                insert_query = """
-                    INSERT INTO FactJobPostingDaily (
-                        fact_id, job_sk, company_sk, date_id, 
-                        salary_min, salary_max, salary_type, 
-                        due_date, time_remaining, verified_employer,
-                        posted_time, crawled_at, load_month
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """
-                
-                insert_values = [
-                    fact_id,
-                    job_sk, company_sk, date_id,
-                    job.salary_min if pd.notna(job.salary_min) else None,
-                    job.salary_max if pd.notna(job.salary_max) else None,
-                    job.salary_type if pd.notna(job.salary_type) else None,
-                    due_date,
-                    job.time_remaining if pd.notna(job.time_remaining) else None,
-                    job.verified_employer if pd.notna(job.verified_employer) else False,
-                    posted_time,
-                    crawled_at,
-                    load_month
-                ]
-                
-                try:
-                    self.duck_conn.execute(insert_query, insert_values)
-                    logger.debug(f"Inserted new fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
-                    self.duck_conn.execute("COMMIT")
+                if post_check:
+                    fact_id = post_check[0]
+                    logger.debug(f"🔍 Found fact_id after UPSERT: {fact_id}, job_sk={job_sk}, date_id={date_id}")
                     return fact_id
-                except Exception as e1:
-                    # Rollback transaction
-                    self.duck_conn.execute("ROLLBACK")
-                    
-                    # Nếu gặp lỗi, có thể là do xung đột với fact_id đã tồn tại
-                    logger.warning(f"Lỗi khi insert với fact_id chỉ định: {e1}")
-                    
-                    # Thử lại với transaction mới và fact_id trong range khác
-                    self.duck_conn.execute("BEGIN TRANSACTION")
-                    try:
-                        # Kiểm tra lại một lần nữa
-                        final_check = self.duck_conn.execute(
-                            "SELECT fact_id FROM FactJobPostingDaily WHERE job_sk = ? AND date_id = ?", 
-                            [job_sk, date_id]
-                        ).fetchone()
-                        
-                        if final_check:
-                            # Đã được tạo bởi process khác
-                            self.duck_conn.execute("COMMIT")
-                            return final_check[0]
-                        
-                        # Tạo fact_id mới với range khác hoàn toàn (8000000+)
-                        unique_id = uuid.uuid4().int
-                        timestamp_ms = int(time.time() * 1000)
-                        fact_id = 8000000 + (abs(hash(f"{job_sk}_{date_id}_{uuid.uuid4()}")) + timestamp_ms) % (10**6)
-                        
-                        # Kiểm tra xem fact_id mới đã tồn tại chưa
-                        check_id_query = "SELECT 1 FROM FactJobPostingDaily WHERE fact_id = ?"
-                        id_exists = self.duck_conn.execute(check_id_query, [fact_id]).fetchone() is not None
-                        
-                        # Nếu fact_id đã tồn tại, tạo một giá trị khác
-                        retry_count = 0
-                        while id_exists and retry_count < 10:
-                            retry_count += 1
-                            fact_id = 8000000 + (abs(hash(f"{job_sk}_{date_id}_{uuid.uuid4()}_{retry_count}")) + timestamp_ms + retry_count * 50000) % (10**6)
-                            id_exists = self.duck_conn.execute(check_id_query, [fact_id]).fetchone() is not None
-                        
-                        if id_exists:
-                            logger.warning(f"Không thể tạo fact_id duy nhất sau 10 lần thử trong retry cho job_sk={job_sk}, date_id={date_id}")
-                            self.duck_conn.execute("ROLLBACK")
-                            return None
-                        
-                        # Thử lại với fact_id mới
-                        insert_values[0] = fact_id
-                        self.duck_conn.execute(insert_query, insert_values)
-                        logger.debug(f"Inserted new fact record (retry): job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
-                        self.duck_conn.execute("COMMIT")
-                        return fact_id
-                    except Exception as e2:
-                        self.duck_conn.execute("ROLLBACK")
-                        logger.error(f"Lỗi khi thử insert lần 2: {e2}")
-                        return None
-            
-            except Exception as e:
-                # Rollback transaction
-                self.duck_conn.execute("ROLLBACK")
-                logger.error(f"Lỗi khi xử lý transaction cho fact record: {e}")
-                return None
-                
+                else:
+                    logger.error(f"❌ No fact_id found after UPSERT: job_sk={job_sk}, date_id={date_id}")
+                    return None
         except Exception as e:
-            logger.error(f"Lỗi nghiêm trọng khi tạo fact record cho job_id={job.job_id}, date={date_id}: {e}")
-            # Đảm bảo transaction được rollback nếu có lỗi
-            try:
-                self.duck_conn.execute("ROLLBACK")
-            except:
-                pass
+            logger.error(f"Lỗi khi tạo fact record cho job_id={job.job_id}, date={date_id}: {e}")
             return None

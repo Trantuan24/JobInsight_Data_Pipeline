@@ -161,9 +161,7 @@ def get_staging_batch(last_etl_date: datetime) -> pd.DataFrame:
         df = get_dataframe(query, params=(last_etl_date, last_etl_date))
         logger.info(f"Đã lấy {len(df)} bản ghi từ staging (từ {last_etl_date})")
         
-        # Log các cột để debug
-        if not df.empty:
-            logger.info(f"Các cột có trong dữ liệu: {list(df.columns)}")
+        # REMOVED: Debug column logging - not needed in production
         
         return df
     except Exception as e:
@@ -355,372 +353,15 @@ def batch_insert_records(duck_conn: duckdb.DuckDBPyConnection, table_name: str, 
     logger.info(f"Đã batch insert {inserted_count} records vào {table_name}")
     return inserted_count
 
-def process_dimension_with_scd2(
-    duck_conn: duckdb.DuckDBPyConnection,
-    staging_records: pd.DataFrame,
-    dim_table: str,
-    prepare_function,
-    natural_key: str,
-    surrogate_key: str,
-    compare_columns: List[str]
-) -> Dict[str, int]:
-    """
-    Xử lý dimension table với SCD Type 2
-    
-    Args:
-        duck_conn: Kết nối DuckDB
-        staging_records: Dữ liệu staging
-        dim_table: Tên bảng dimension
-        prepare_function: Function chuẩn bị dữ liệu
-        natural_key: Natural key column
-        surrogate_key: Surrogate key column
-        compare_columns: Columns để so sánh thay đổi
-    
-    Returns:
-        Dict thống kê insert/update
-    """
-    logger.info(f"Xử lý {dim_table} với SCD Type 2")
-    
-    # Chuẩn bị dữ liệu
-    prepared_data = prepare_function(staging_records)
-    
-    if prepared_data.empty:
-        logger.warning(f"Không có dữ liệu để xử lý cho {dim_table}")
-        return {'inserted': 0, 'updated': 0, 'unchanged': 0}
-    
-    # Kiểm tra thay đổi
-    to_insert, to_update, unchanged = check_dimension_changes(
-        duck_conn, prepared_data, dim_table, natural_key, compare_columns
-    )
-    
-    stats = {
-        'inserted': 0,
-        'updated': 0,
-        'unchanged': len(unchanged)
-    }
-    
-    # Áp dụng updates (SCD Type 2)
-    if to_update:
-        apply_scd_type2_updates(duck_conn, dim_table, surrogate_key, to_update)
-        stats['updated'] = len(to_update)
-    
-    # Insert records mới
-    if not to_insert.empty:
-        insert_records = []
-        for _, record in to_insert.iterrows():
-            record_dict = record.to_dict()
-            # Loại bỏ surrogate key
-            if surrogate_key in record_dict:
-                del record_dict[surrogate_key]
-            insert_records.append(record_dict)
-        
-        stats['inserted'] = batch_insert_records(duck_conn, dim_table, insert_records)
-    
-    logger.info(f"{dim_table} - Inserted: {stats['inserted']}, Updated: {stats['updated']}, Unchanged: {stats['unchanged']}")
-    return stats
+# REMOVED: Redundant process_dimension_with_scd2 function
+# This functionality is now handled by DimensionHandler.process_dimension_with_scd2() in dimension_handler.py
 
-def generate_fact_records(
-    duck_conn: duckdb.DuckDBPyConnection,
-    staging_records: pd.DataFrame
-) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Tạo bản ghi fact và bridge từ dữ liệu staging
-    
-    Args:
-        duck_conn: Kết nối DuckDB
-        staging_records: Dữ liệu từ staging
-    
-    Returns:
-        Tuple chứa (fact_records, bridge_records)
-    """
-    fact_records = []
-    bridge_records = []
-    
-    # Thống kê job_ids để log
-    job_ids = set()
-    date_counts = {}
-    skipped_jobs = 0
-    
-    # Chuẩn bị lookup cho Unknown location
-    unknown_location_sk = lookup_location_key(duck_conn, None, 'Unknown', None)
-    
-    # Tạo cache cho location lookups để tránh truy vấn lặp lại
-    location_cache = {}
-    
-    for _, job in staging_records.iterrows():
-        # Lookup dimension keys
-        job_sk = lookup_dimension_key(
-            duck_conn, 'DimJob', 'job_id', job.job_id, 'job_sk'
-        )
-        
-        company_name = job.company_name_standardized if pd.notna(job.company_name_standardized) else job.company_name
-        company_sk = lookup_dimension_key(
-            duck_conn, 'DimCompany', 'company_name_standardized', company_name, 'company_sk'
-        )
-        
-        # Check if required keys exist
-        if not job_sk or not company_sk:
-            logger.warning(f"Bỏ qua job_id={job.job_id}: Không tìm thấy dimension key (job_sk={job_sk}, company_sk={company_sk})")
-            skipped_jobs += 1
-            continue
-        
-        # Xử lý ngày
-        due_date = pd.to_datetime(job.due_date) if pd.notna(job.due_date) else None
-        posted_time = pd.to_datetime(job.posted_time) if pd.notna(job.posted_time) else None
-        crawled_at = pd.to_datetime(job.crawled_at) if pd.notna(job.crawled_at) else datetime.now()
-        
-        # Tạo danh sách các ngày cần tạo fact records
-        daily_dates = generate_daily_fact_records(posted_time, due_date)
-        
-        # Tính load_month
-        load_month = calculate_load_month(crawled_at)
-        
-        # Thống kê để log
-        job_ids.add(job.job_id)
-        date_counts[job.job_id] = len(daily_dates)
-        
-        # Parse location string - Di chuyển ra ngoài vòng lặp ngày
-        location_str = None
-        if 'location_pairs' in job and pd.notna(job.location_pairs):
-            location_str = str(job.location_pairs)
-        elif 'location' in job and pd.notna(job.location):
-            location_str = str(job.location)
-            
-        # Parse location thành các tuple (province, city, district)
-        parsed_locations = parse_job_location(location_str) if location_str else []
-        
-        # Tìm location_sk cho tất cả locations của job này trước
-        location_sks = set()
-        if parsed_locations:
-            for province, city, district in parsed_locations:
-                # Tạo cache key
-                cache_key = f"{province}:{city}:{district}"
-                
-                if cache_key in location_cache:
-                    location_sk = location_cache[cache_key]
-                else:
-                    # Thử lookup với đầy đủ thông tin trước
-                    location_sk = lookup_location_key(duck_conn, province, city, district)
-                    
-                    if not location_sk and city:
-                        # Thử với chỉ province + city
-                        location_sk = lookup_location_key(duck_conn, province, city, None)
-                        
-                    if not location_sk and city:
-                        # Thử với chỉ city
-                        location_sk = lookup_location_key(duck_conn, None, city, None)
-                    
-                    # Lưu vào cache
-                    location_cache[cache_key] = location_sk
-                
-                if location_sk:
-                    location_sks.add(location_sk)
-        
-        # Nếu không tìm được location nào, dùng Unknown
-        if not location_sks and unknown_location_sk:
-            location_sks.add(unknown_location_sk)
-        
-        # Tạo fact records cho từng ngày
-        for date_id in daily_dates:
-            try:
-                # Kiểm tra xem fact record đã tồn tại chưa
-                check_query = """
-                    SELECT fact_id FROM FactJobPostingDaily 
-                    WHERE job_sk = ? AND date_id = ?
-                """
-                existing_fact = duck_conn.execute(check_query, [job_sk, date_id]).fetchone()
-                
-                # Chuẩn bị common values cho cả insert và update
-                common_values = {
-                    'job_sk': job_sk,
-                    'company_sk': company_sk,
-                    'date_id': date_id,
-                    'salary_min': job.salary_min if pd.notna(job.salary_min) else None,
-                    'salary_max': job.salary_max if pd.notna(job.salary_max) else None,
-                    'salary_type': job.salary_type if pd.notna(job.salary_type) else None,
-                    'due_date': due_date,
-                    'time_remaining': job.time_remaining if pd.notna(job.time_remaining) else None,
-                    'verified_employer': job.verified_employer if pd.notna(job.verified_employer) else False,
-                    'posted_time': posted_time,
-                    'crawled_at': crawled_at,
-                    'load_month': load_month
-                }
-                
-                fact_id = None
-                if existing_fact:
-                    # Đã tồn tại, cập nhật
-                    fact_id = existing_fact[0]
-                    
-                    # Lọc ra các giá trị không null để update
-                    non_null_items = {k: v for k, v in common_values.items() if v is not None}
-                    set_clauses = [f"{k} = ?" for k in non_null_items.keys()]
-                    values = list(non_null_items.values()) + [fact_id]
-                    
-                    update_query = f"""
-                        UPDATE FactJobPostingDaily 
-                        SET {', '.join(set_clauses)}
-                        WHERE fact_id = ?
-                    """
-                    
-                    try:
-                        duck_conn.execute(update_query, values)
-                        logger.debug(f"Updated existing fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
-                    except Exception as e:
-                        logger.error(f"Lỗi khi update fact record cho job_id={job.job_id}, date={date_id}: {e}")
-                        continue
-                        
-                else:
-                    # Chưa tồn tại, tạo mới
-                    # Lọc ra các giá trị không null để insert
-                    non_null_items = {k: v for k, v in common_values.items() if v is not None}
-                    columns = ', '.join(non_null_items.keys())
-                    placeholders = ', '.join(['?'] * len(non_null_items))
-                    values = list(non_null_items.values())
-                    
-                    insert_query = f"""
-                        INSERT INTO FactJobPostingDaily ({columns})
-                        VALUES ({placeholders})
-                        RETURNING fact_id
-                    """
-                    
-                    try:
-                        result = duck_conn.execute(insert_query, values).fetchone()
-                        if not result:
-                            logger.warning(f"Không thể insert fact record cho job_id={job.job_id}, date={date_id}")
-                            continue
-                            
-                        fact_id = result[0]
-                        fact_records.append(common_values)
-                        logger.debug(f"Inserted new fact record: job_sk={job_sk}, date_id={date_id}, fact_id={fact_id}")
-                    
-                    except Exception as e:
-                        logger.error(f"Lỗi khi insert fact record cho job_id={job.job_id}, date={date_id}: {e}")
-                        continue
-                
-                # Xóa bridge records cũ cho fact_id này
-                duck_conn.execute("DELETE FROM FactJobLocationBridge WHERE fact_id = ?", [fact_id])
-                
-                # Tạo bridge records cho tất cả locations đã tìm thấy
-                for location_sk in location_sks:
-                    bridge_records.append({'fact_id': fact_id, 'location_sk': location_sk})
-                        
-            except Exception as e:
-                logger.error(f"Lỗi khi xử lý fact record cho job_id={job.job_id}, date={date_id}: {e}", exc_info=True)
-                continue
-    
-    # Log kết quả
-    logger.info(f"Đã tạo {len(fact_records)} fact records cho {len(job_ids)} jobs")
-    logger.info(f"Đã tạo {len(bridge_records)} bridge records")
-    logger.info(f"Số jobs bị bỏ qua: {skipped_jobs}")
-    
-    # Log phân bố số fact records trên mỗi job
-    if date_counts:
-        avg_dates = sum(date_counts.values()) / len(date_counts)
-        max_dates = max(date_counts.values() if date_counts else [0])
-        logger.info(f"Trung bình {avg_dates:.1f} ngày/job, tối đa {max_dates} ngày/job")
-    
-    return fact_records, bridge_records
+# REMOVED: Redundant generate_fact_records function
+# This functionality is now handled by FactHandler.generate_fact_records() in fact_handler.py
 
 
-def cleanup_duplicate_fact_records(duck_conn: duckdb.DuckDBPyConnection):
-    """
-    Dọn dẹp các duplicate records trong FactJobPostingDaily và FactJobLocationBridge
-    """
-    logger.info("Bắt đầu dọn dẹp duplicate fact records...")
-    
-    try:
-        # 1. Backup bridge records trước khi xóa
-        logger.info("Backup bridge records...")
-        backup_bridge_query = """
-            CREATE OR REPLACE TEMP TABLE bridge_backup AS
-            SELECT DISTINCT fact_id, location_sk 
-            FROM FactJobLocationBridge
-        """
-        duck_conn.execute(backup_bridge_query)
-        
-        # 2. Tìm và xóa duplicate fact records, giữ lại record có fact_id nhỏ nhất
-        logger.info("Tìm duplicate fact records...")
-        find_duplicates_query = """
-            SELECT job_sk, date_id, COUNT(*) as count, MIN(fact_id) as keep_fact_id
-            FROM FactJobPostingDaily
-            GROUP BY job_sk, date_id
-            HAVING COUNT(*) > 1
-        """
-        
-        duplicates = duck_conn.execute(find_duplicates_query).fetchdf()
-        
-        if not duplicates.empty:
-            logger.info(f"Tìm thấy {len(duplicates)} nhóm duplicate fact records")
-            
-            total_deleted = 0
-            for _, dup in duplicates.iterrows():
-                job_sk, date_id, count, keep_fact_id = dup['job_sk'], dup['date_id'], dup['count'], dup['keep_fact_id']
-                
-                # Lấy danh sách fact_id cần xóa (tất cả trừ keep_fact_id)
-                get_delete_ids_query = """
-                    SELECT fact_id FROM FactJobPostingDaily
-                    WHERE job_sk = ? AND date_id = ? AND fact_id != ?
-                """
-                delete_ids = duck_conn.execute(get_delete_ids_query, [job_sk, date_id, keep_fact_id]).fetchall()
-                
-                if delete_ids:
-                    fact_ids_to_delete = [row[0] for row in delete_ids]
-                    placeholders = ','.join(['?'] * len(fact_ids_to_delete))
-                    
-                    # Xóa bridge records trước
-                    delete_bridge_query = f"""
-                        DELETE FROM FactJobLocationBridge 
-                        WHERE fact_id IN ({placeholders})
-                    """
-                    duck_conn.execute(delete_bridge_query, fact_ids_to_delete)
-                    
-                    # Xóa fact records
-                    delete_fact_query = f"""
-                        DELETE FROM FactJobPostingDaily 
-                        WHERE fact_id IN ({placeholders})
-                    """
-                    duck_conn.execute(delete_fact_query, fact_ids_to_delete)
-                    
-                    total_deleted += len(fact_ids_to_delete)
-                    logger.debug(f"Đã xóa {len(fact_ids_to_delete)} duplicate records cho job_sk={job_sk}, date_id={date_id}")
-            
-            logger.info(f"Đã xóa tổng cộng {total_deleted} duplicate fact records")
-            
-            # 3. Restore bridge records cho các fact_id còn lại
-            logger.info("Restore bridge records...")
-            restore_bridge_query = """
-                INSERT INTO FactJobLocationBridge (fact_id, location_sk)
-                SELECT DISTINCT b.fact_id, b.location_sk
-                FROM bridge_backup b
-                JOIN FactJobPostingDaily f ON b.fact_id = f.fact_id
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM FactJobLocationBridge fb 
-                    WHERE fb.fact_id = b.fact_id AND fb.location_sk = b.location_sk
-                )
-            """
-            duck_conn.execute(restore_bridge_query)
-            
-        else:
-            logger.info("Không tìm thấy duplicate fact records")
-            
-        # 4. Thống kê sau khi dọn dẹp
-        stats_query = """
-            SELECT 
-                COUNT(*) as total_facts,
-                (SELECT COUNT(*) FROM (SELECT DISTINCT job_sk, date_id FROM FactJobPostingDaily)) as unique_combinations
-            FROM FactJobPostingDaily
-        """
-        stats = duck_conn.execute(stats_query).fetchone()
-        logger.info(f"Sau dọn dẹp: {stats[0]} fact records, {stats[1]} unique combinations")
-        
-        if stats[0] != stats[1]:
-            logger.warning(f"Vẫn còn {stats[0] - stats[1]} duplicate records!")
-        else:
-            logger.info("✅ Đã dọn dẹp thành công tất cả duplicate records")
-            
-    except Exception as e:
-        logger.error(f"Lỗi khi dọn dẹp duplicate records: {e}")
-        raise
+# REMOVED: Redundant cleanup_duplicate_fact_records function
+# This functionality is now handled by FactHandler.cleanup_duplicate_fact_records() in fact_handler.py
 
 def verify_etl_integrity(staging_count: int, fact_count: int, threshold: float = 0.9) -> bool:
     """
@@ -803,20 +444,25 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
         with get_duckdb_connection(DUCKDB_PATH) as duck_conn:
             # Dọn dẹp duplicate records hiện có (chạy 1 lần)
             logger.info("🧹 Dọn dẹp duplicate records hiện có...")
-            cleanup_duplicate_fact_records(duck_conn)
+            from src.etl.fact_handler import FactHandler
+            fact_handler = FactHandler(duck_conn)
+            cleanup_result = fact_handler.cleanup_duplicate_fact_records()
+            logger.info(f"✅ Cleanup result: {cleanup_result}")
             
             # 5. Xử lý và insert dữ liệu với SCD Type 2
+            from src.etl.dimension_handler import DimensionHandler
+            dim_handler = DimensionHandler(duck_conn)
             dim_stats = {}
-            
+
             # 5.1 DimJob với SCD Type 2
-            dim_stats['DimJob'] = process_dimension_with_scd2(
-                duck_conn, staging_batch, 'DimJob', prepare_dim_job,
+            dim_stats['DimJob'] = dim_handler.process_dimension_with_scd2(
+                staging_batch, 'DimJob', prepare_dim_job,
                 'job_id', 'job_sk', ['title_clean', 'skills', 'job_url']
             )
-        
+
             # 5.2. DimCompany với SCD Type 2
-            dim_stats['DimCompany'] = process_dimension_with_scd2(
-                duck_conn, staging_batch, 'DimCompany', prepare_dim_company,
+            dim_stats['DimCompany'] = dim_handler.process_dimension_with_scd2(
+                staging_batch, 'DimCompany', prepare_dim_company,
                 'company_name_standardized', 'company_sk', ['company_url', 'verified_employer']
             )
         
@@ -862,7 +508,7 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
         
             # 5.5. Insert dữ liệu vào FactJobPostingDaily và FactJobLocationBridge
             logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
-            fact_records, bridge_records = generate_fact_records(duck_conn, staging_batch)
+            fact_records, bridge_records = fact_handler.generate_fact_records(staging_batch)
             
             # Kiểm tra tính toàn vẹn của dữ liệu
             if not verify_etl_integrity(len(staging_batch), len(fact_records)):

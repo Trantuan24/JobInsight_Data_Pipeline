@@ -14,12 +14,22 @@ import os
 import json
 import logging
 import sys
+import time
 from datetime import datetime
+from contextlib import contextmanager
 import pandas as pd
 import numpy as np
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from bs4 import BeautifulSoup
+
+# Import for performance monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.warning("psutil not available - performance monitoring will be limited")
 
 # Thiết lập đường dẫn và logging
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +60,52 @@ SQL_DIR = os.path.join(PROJECT_ROOT, "sql")
 if not os.path.exists(SQL_DIR):
     SQL_DIR = os.path.join(os.getcwd(), "sql")
     os.makedirs(SQL_DIR, exist_ok=True)
+
+@contextmanager
+def performance_monitor(phase_name):
+    """
+    Context manager để monitor performance cho từng phase
+
+    Args:
+        phase_name (str): Tên phase để tracking
+    """
+    # Start metrics
+    start_time = time.time()
+    start_memory = 0
+    start_cpu = 0
+
+    if PSUTIL_AVAILABLE:
+        try:
+            process = psutil.Process()
+            start_memory = process.memory_info().rss / 1024 / 1024  # MB
+            start_cpu = process.cpu_percent()
+        except:
+            pass
+
+    try:
+        yield
+    finally:
+        # End metrics
+        duration = time.time() - start_time
+        end_memory = start_memory
+        end_cpu = start_cpu
+
+        if PSUTIL_AVAILABLE:
+            try:
+                process = psutil.Process()
+                end_memory = process.memory_info().rss / 1024 / 1024  # MB
+                end_cpu = process.cpu_percent()
+            except:
+                pass
+
+        # Log performance metrics
+        logger.info(f"📊 {phase_name} Performance:")
+        logger.info(f"  ⏱️  Duration: {duration*1000:.1f}ms")
+        if PSUTIL_AVAILABLE and end_memory > 0:
+            logger.info(f"  🧠 Memory: {end_memory:.1f}MB (Δ{end_memory-start_memory:+.1f}MB)")
+            logger.info(f"  ⚡ CPU: {end_cpu:.1f}%")
+        else:
+            logger.info(f"  📈 Resource monitoring not available")
 
 def setup_database_schema():
     """Thiết lập schema và bảng"""
@@ -131,33 +187,57 @@ def setup_database_schema():
         return False
 
 def run_stored_procedures():
-    """Thực thi stored procedures"""
+    """Thực thi stored procedures - OPTIMIZED VERSION"""
     try:
         logger.info("Đang thực thi stored procedures...")
-        
-        # Thực thi file stored procedures để đảm bảo các hàm đã được tạo
-        stored_procs_file = os.path.join(SQL_DIR, "stored_procedures.sql")
-        if os.path.exists(stored_procs_file):
-            if not execute_sql_file(stored_procs_file):
-                logger.error("Không thể tạo stored procedures!")
-                return False
-        else:
-            logger.error(f"Không tìm thấy file stored procedures: {stored_procs_file}")
-            return False
-        
-        # Gọi stored procedure cập nhật deadline
-        try:
-            logger.info("Thực thi stored procedure update_deadline...")
-            execute_stored_procedure('update_deadline')
-            logger.info("Đã cập nhật thành công thời gian còn lại")
-            
-            # Có thể thêm các stored procedures khác nếu cần
-            
+
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Kiểm tra function đã tồn tại chưa để tránh re-create
+            cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM pg_proc p
+                    JOIN pg_namespace n ON p.pronamespace = n.oid
+                    WHERE n.nspname = 'jobinsight_staging'
+                    AND p.proname = 'normalize_salary'
+                );
+            """)
+            function_exists = cursor.fetchone()[0]
+
+            if not function_exists:
+                logger.info("Tạo stored procedures lần đầu...")
+                stored_procs_file = os.path.join(SQL_DIR, "stored_procedures.sql")
+                if os.path.exists(stored_procs_file):
+                    if not execute_sql_file(stored_procs_file):
+                        logger.error("Không thể tạo stored procedures!")
+                        return False
+                else:
+                    logger.error(f"Không tìm thấy file stored procedures: {stored_procs_file}")
+                    return False
+            else:
+                logger.info("Stored procedures đã tồn tại, bỏ qua tạo mới")
+
+            # Chạy trực tiếp SQL thay vì stored procedure để tăng performance
+            logger.info("Cập nhật thời gian còn lại...")
+            cursor.execute("""
+                UPDATE jobinsight_staging.staging_jobs
+                SET time_remaining = CASE
+                    WHEN due_date > CURRENT_TIMESTAMP THEN
+                        'Còn ' || EXTRACT(day FROM (due_date - CURRENT_TIMESTAMP))::int || ' ngày để ứng tuyển'
+                    WHEN due_date > CURRENT_TIMESTAMP - INTERVAL '1 day' AND due_date <= CURRENT_TIMESTAMP THEN
+                        'Đã hết thời gian ứng tuyển'
+                    ELSE 'Đã hết thời gian ứng tuyển'
+                END
+                WHERE time_remaining IS NULL OR time_remaining = '';
+            """)
+
+            updated_rows = cursor.rowcount
+            conn.commit()
+            logger.info(f"Đã cập nhật thành công thời gian còn lại cho {updated_rows} bản ghi")
+
             return True
-        except Exception as e:
-            logger.error(f"Lỗi khi thực thi stored procedure: {e}")
-            return False
-            
+
     except Exception as e:
         logger.error(f"Lỗi khi thực thi stored procedures: {e}")
         return False
@@ -202,62 +282,69 @@ def load_staging_data(limit=None, offset=0, query_filter=None):
 
 def save_back_to_staging(df):
     """
-    Lưu DataFrame đã xử lý trở lại bảng staging_jobs
-    
+    Lưu DataFrame đã xử lý trở lại bảng staging_jobs - OPTIMIZED VERSION
+
     Args:
         df: DataFrame đã xử lý
-        
+
     Returns:
         bool: Kết quả thực hiện
     """
     try:
-        # Sửa lại tên bảng để tránh lặp lại schema
         table_name = f"{DWH_STAGING_SCHEMA}.staging_jobs"
         logger.info(f"Đang lưu {len(df)} bản ghi vào bảng {table_name}...")
-        
-        # Cách đơn giản hơn sử dụng upsert trực tiếp
-        from sqlalchemy import create_engine, text
-        engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
-        
+
         # Tạo một bản sao để tránh sửa đổi df gốc
         df_to_save = df.copy()
-        
-        # Xử lý các cột kiểu JSONB
-        for col in ['skills', 'location_pairs', 'raw_data']:
+
+        # Xử lý các cột kiểu JSONB một cách hiệu quả hơn
+        json_columns = ['skills', 'location_pairs', 'raw_data']
+        for col in json_columns:
             if col in df_to_save.columns:
-                df_to_save[col] = df_to_save[col].apply(
-                    lambda x: json.dumps(x) if isinstance(x, (list, dict)) else 
-                             (None if pd.isna(x) else json.dumps(x))
+                # Vectorized JSON processing thay vì apply()
+                df_to_save[col] = df_to_save[col].map(
+                    lambda x: json.dumps(x) if isinstance(x, (list, dict)) else
+                             (None if pd.isna(x) else str(x))
                 )
-        
-        # Tạo temporary table trong phiên làm việc hiện tại
+
+        # Sử dụng bulk operations thay vì temporary table
+        from sqlalchemy import create_engine, text
+        engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+
         with engine.begin() as conn:
-            # Tạo bảng tạm
-            conn.execute(text("DROP TABLE IF EXISTS temp_staging_jobs"))
-            conn.execute(text(f"CREATE TABLE temp_staging_jobs (LIKE {table_name})"))
-            
-            # Lưu DataFrame vào bảng tạm
-            df_to_save.to_sql('temp_staging_jobs', conn, if_exists='append', index=False)
-            
-            # Thực hiện upsert từ bảng tạm vào bảng chính
+            # Sử dụng pandas to_sql với method='multi' cho performance tốt hơn
+            temp_table = f"temp_staging_{int(datetime.now().timestamp())}"
+
+            # Tạo temp table với cùng structure
+            conn.execute(text(f"CREATE TEMP TABLE {temp_table} (LIKE {table_name})"))
+
+            # Bulk insert vào temp table
+            df_to_save.to_sql(
+                temp_table,
+                conn,
+                if_exists='append',
+                index=False,
+                method='multi',  # Faster bulk insert
+                chunksize=1000   # Process in chunks
+            )
+
+            # Single efficient upsert query
             update_columns = [c for c in df_to_save.columns if c != 'job_id']
-            update_stmt = ", ".join([f"{col} = excluded.{col}" for col in update_columns])
-            
+            update_stmt = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+
             upsert_query = f"""
             INSERT INTO {table_name}
-            SELECT * FROM temp_staging_jobs
-            ON CONFLICT (job_id) 
+            SELECT * FROM {temp_table}
+            ON CONFLICT (job_id)
             DO UPDATE SET {update_stmt}
             """
-            
-            # Thực thi upsert
-            conn.execute(text(upsert_query))
-            
-            # Xóa bảng tạm
-            conn.execute(text("DROP TABLE IF EXISTS temp_staging_jobs"))
-        
+
+            result = conn.execute(text(upsert_query))
+            logger.info(f"Upsert completed: {result.rowcount} rows affected")
+
         logger.info(f"Đã cập nhật thành công {len(df)} bản ghi vào bảng {table_name}")
         return True
+
     except Exception as e:
         logger.error(f"Lỗi khi lưu dữ liệu vào bảng {table_name}: {e}")
         return False
@@ -343,16 +430,18 @@ def run_etl(batch_size=None, only_unprocessed=False, verbose=False):
         
         logger.info(f"Bắt đầu ETL từ raw_jobs sang staging_jobs (batch_size={batch_size}, only_unprocessed={only_unprocessed})...")
         start_time = datetime.now()
-        
+
         # 1. Thiết lập schema và bảng nếu cần
-        if not setup_database_schema():
-            logger.error("Không thể thiết lập schema và bảng!")
-            return {"success": False, "error": "Không thể thiết lập schema và bảng!"}
-        
+        with performance_monitor("Schema Setup"):
+            if not setup_database_schema():
+                logger.error("Không thể thiết lập schema và bảng!")
+                return {"success": False, "error": "Không thể thiết lập schema và bảng!"}
+
         # 2. Chạy stored procedures để xử lý dữ liệu cơ bản
-        if not run_stored_procedures():
-            logger.warning("Có lỗi khi thực thi stored procedures!")
-            # Vẫn tiếp tục vì có thể một số SP đã chạy thành công
+        with performance_monitor("Stored Procedures"):
+            if not run_stored_procedures():
+                logger.warning("Có lỗi khi thực thi stored procedures!")
+                # Vẫn tiếp tục vì có thể một số SP đã chạy thành công
         
         # 3. Load dữ liệu từ staging để xử lý thêm bằng pandas
         try:
@@ -360,10 +449,11 @@ def run_etl(batch_size=None, only_unprocessed=False, verbose=False):
             query_filter = None
             if only_unprocessed:
                 query_filter = "WHERE processed IS NULL OR processed = FALSE"
-                
-            staging_df = load_staging_data(limit=batch_size, query_filter=query_filter)
-            source_count = len(staging_df)
-            
+
+            with performance_monitor("Data Loading"):
+                staging_df = load_staging_data(limit=batch_size, query_filter=query_filter)
+                source_count = len(staging_df)
+
             if source_count == 0:
                 logger.warning("Không có dữ liệu trong bảng staging_jobs để xử lý!")
                 return {
@@ -379,28 +469,30 @@ def run_etl(batch_size=None, only_unprocessed=False, verbose=False):
                         "batch_count": 0
                     }
                 }
-                
+
             # 4. Xử lý chi tiết bằng pandas
-            processed_df = process_staging_data(staging_df)
-            processed_count = len(processed_df)
-            
-            # Kiểm tra tính toàn vẹn dữ liệu sau bước xử lý
-            if not verify_etl_integrity(source_count, processed_count):
-                logger.warning("Phát hiện mất mát dữ liệu trong quá trình xử lý!")
-                # Vẫn tiếp tục nhưng đã cảnh báo
-            
+            with performance_monitor("Data Processing"):
+                processed_df = process_staging_data(staging_df)
+                processed_count = len(processed_df)
+
+                # Kiểm tra tính toàn vẹn dữ liệu sau bước xử lý
+                if not verify_etl_integrity(source_count, processed_count):
+                    logger.warning("Phát hiện mất mát dữ liệu trong quá trình xử lý!")
+                    # Vẫn tiếp tục nhưng đã cảnh báo
+
             # 5. Lưu kết quả trở lại bảng staging
-            if not save_back_to_staging(processed_df):
-                logger.error("Không thể lưu kết quả vào bảng staging!")
-                return {
-                    "success": False,
-                    "error": "Không thể lưu kết quả vào bảng staging",
-                    "stats": {
-                        "total_records": source_count,
-                        "processed_records": processed_count,
-                        "duration_seconds": (datetime.now() - start_time).total_seconds()
+            with performance_monitor("Data Saving"):
+                if not save_back_to_staging(processed_df):
+                    logger.error("Không thể lưu kết quả vào bảng staging!")
+                    return {
+                        "success": False,
+                        "error": "Không thể lưu kết quả vào bảng staging",
+                        "stats": {
+                            "total_records": source_count,
+                            "processed_records": processed_count,
+                            "duration_seconds": (datetime.now() - start_time).total_seconds()
+                        }
                     }
-                }
         except Exception as e:
             logger.error(f"Lỗi khi xử lý dữ liệu staging: {e}")
             return {

@@ -83,13 +83,15 @@ def backup_dwh_database():
         # Đóng tất cả kết nối đến DuckDB trước khi backup
         # Đây là bước quan trọng để tránh file bị lock
         try:
-            # Tạo kết nối mới và đóng tất cả các kết nối hiện có
+            # FIXED: DuckDB doesn't support shutdown_transactions pragma
+            # Simply ensure any existing connections are properly closed
             temp_conn = duckdb.connect(DUCKDB_PATH)
-            temp_conn.execute("PRAGMA shutdown_transactions")
+            # Just test connection and close - no need for shutdown_transactions
+            temp_conn.execute("SELECT 1")
             temp_conn.close()
-            logger.info("Đã đóng tất cả kết nối hiện có đến DuckDB")
+            logger.info("Đã kiểm tra và đóng kết nối DuckDB")
         except Exception as e:
-            logger.warning(f"Không thể đóng kết nối hiện có: {e}")
+            logger.warning(f"Không thể kiểm tra kết nối DuckDB: {e}")
         
         # Copy file DuckDB hiện tại sang file backup
         shutil.copy2(DUCKDB_PATH, backup_path)
@@ -240,9 +242,7 @@ def get_staging_batch(last_etl_date: datetime) -> pd.DataFrame:
         df = get_dataframe(query, params=(last_etl_date, last_etl_date))
         logger.info(f"Đã lấy {len(df)} bản ghi từ staging (từ {last_etl_date})")
         
-        # Log các cột để debug
-        if not df.empty:
-            logger.info(f"Các cột có trong dữ liệu: {list(df.columns)}")
+        # REMOVED: Debug column logging - not needed in production
         
         return df
     except Exception as e:
@@ -490,8 +490,7 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
                 fact_duration = (datetime.now() - fact_start).total_seconds()
                 logger.info(f"✅ Fact tables xử lý hoàn tất trong {fact_duration:.2f} giây. Đã tạo {len(fact_records)} fact records và {len(bridge_records)} bridge records.")
                 
-                # Đánh dấu đã xử lý trong staging
-                processed_ids = staging_batch['job_id'].tolist()
+                # REMOVED: processed_ids not used - staging marking handled elsewhere
                 
                 # Tóm tắt kết quả
                 dim_stats = {
@@ -536,12 +535,13 @@ def run_staging_to_dwh_etl(last_etl_date: Optional[datetime] = None) -> Dict[str
                 logger.info("🔍 Bắt đầu validation ETL...")
                 validation_start = datetime.now()
                 try:
-                    from src.utils.etl_validator import validate_etl
-                    validation_result = validate_etl(duck_conn)
+                    from src.utils.etl_validator import generate_etl_report, log_validation_results
+                    validation_result = generate_etl_report(duck_conn)
+                    log_validation_results(validation_result)
                     validation_duration = (datetime.now() - validation_start).total_seconds()
-                    logger.info(f"✅ Validation hoàn tất trong {validation_duration:.2f} giây. Kết quả: {validation_result}")
-                except ImportError:
-                    logger.warning("⚠️ Không thể import etl_validator - bỏ qua validation")
+                    logger.info(f"✅ Validation hoàn tất trong {validation_duration:.2f} giây.")
+                except ImportError as e:
+                    logger.warning(f"⚠️ Không thể import etl_validator - bỏ qua validation: {e}")
                 except Exception as e:
                     logger.error(f"❌ Lỗi khi thực hiện validation: {str(e)}")
                 
@@ -771,11 +771,7 @@ def run_staging_to_dwh_etl_batch(staging_batch: pd.DataFrame) -> Dict[str, Any]:
     logger.info(f"Bắt đầu ETL batch với {len(staging_batch)} bản ghi...")
     
     try:
-        # Kiểm tra file DuckDB
-        if os.path.exists(DUCKDB_PATH):
-            logger.debug(f"Sử dụng DuckDB hiện có: {DUCKDB_PATH}")
-        else:
-            logger.info(f"Tạo DuckDB mới: {DUCKDB_PATH}")
+        # REMOVED: Debug DuckDB file logging - not needed
         
         # Thiết lập schema và bảng (giữ nguyên dữ liệu cũ)
         if not setup_duckdb_schema():
@@ -800,7 +796,7 @@ def run_staging_to_dwh_etl_batch(staging_batch: pd.DataFrame) -> Dict[str, Any]:
                     fact_handler = FactHandler(duck_conn)
                     
                     # Dọn dẹp duplicate records hiện có
-                    cleanup_result = fact_handler.cleanup_duplicate_fact_records()
+                    fact_handler.cleanup_duplicate_fact_records()
                     
                     # Xử lý dimension tables
                     logger.info("Xử lý dimension tables với SCD Type 2...")
@@ -838,10 +834,9 @@ def run_staging_to_dwh_etl_batch(staging_batch: pd.DataFrame) -> Dict[str, Any]:
                     
                     # Xử lý fact table
                     logger.info("Xử lý FactJobPostingDaily và FactJobLocationBridge")
-                    fact_records, bridge_records = generate_fact_records_with_retry(fact_handler, staging_batch)
-                    
-                    # Đánh dấu đã xử lý trong staging
-                    processed_ids = staging_batch['job_id'].tolist()
+                    fact_records, _ = generate_fact_records_with_retry(fact_handler, staging_batch)
+
+                    # REMOVED: processed_ids not used
                     
                     # Tóm tắt kết quả
                     dim_stats = {

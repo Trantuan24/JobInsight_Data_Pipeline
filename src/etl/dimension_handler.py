@@ -209,7 +209,7 @@ class DimensionHandler:
                 """
                 self.duck_conn.execute(update_query, [today, surrogate_key_value])
                 
-                # 2. Insert bản ghi mới
+                # 2. Insert bản ghi mới với UPSERT để tránh duplicate key
                 new_record_dict = new_record.to_dict() if hasattr(new_record, 'to_dict') else dict(new_record)
 
                 # Loại bỏ mọi trường liên quan đến surrogate key
@@ -222,21 +222,37 @@ class DimensionHandler:
                 new_record_dict['is_current'] = True
                 new_record_dict['expiry_date'] = None
 
-                # Insert
+                # Handle JSON values
+                for key, val in new_record_dict.items():
+                    if isinstance(val, (dict, list)):
+                        new_record_dict[key] = json.dumps(val)
+
+                # FIXED: Use UPSERT to handle potential duplicates
                 columns = list(new_record_dict.keys())
                 placeholders = ', '.join(['?'] * len(columns))
                 values = [new_record_dict[col] for col in columns]
 
-                # Handle JSON values
-                for i, val in enumerate(values):
-                    if isinstance(val, (dict, list)):
-                        values[i] = json.dumps(val)
+                # Determine natural key for UPSERT
+                if dim_table == 'DimJob':
+                    natural_key = 'job_id'
+                elif dim_table == 'DimCompany':
+                    natural_key = 'company_name_standardized'
+                elif dim_table == 'DimLocation':
+                    natural_key = 'city'  # Simplified for now
+                else:
+                    natural_key = 'id'
 
-                insert_query = f"""
+                # Build UPSERT query
+                update_columns = [col for col in columns if col != natural_key]
+                update_stmt = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+
+                upsert_query = f"""
                     INSERT INTO {dim_table} ({', '.join(columns)})
                     VALUES ({placeholders})
+                    ON CONFLICT ({natural_key})
+                    DO UPDATE SET {update_stmt}
                 """
-                self.duck_conn.execute(insert_query, values)
+                self.duck_conn.execute(upsert_query, values)
                 
                 logger.info(f"Updated {dim_table}: closed old record {old_record[surrogate_key]} and created new record")
                 
