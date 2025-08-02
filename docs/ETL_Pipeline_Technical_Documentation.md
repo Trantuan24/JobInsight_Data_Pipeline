@@ -179,55 +179,55 @@ erDiagram
     DimDate ||--o{ FactJobPostingDaily : "date_id"
 
     DimJob {
-        job_sk PK
-        job_id NK
-        title_clean string
-        skills text
-        job_url string
-        effective_date datetime
-        end_date datetime
-        is_current boolean
+        INTEGER job_sk
+        VARCHAR job_id
+        TEXT title_clean
+        TEXT skills
+        VARCHAR job_url
+        TIMESTAMP effective_date
+        TIMESTAMP end_date
+        BOOLEAN is_current
     }
 
     DimCompany {
-        company_sk PK
-        company_name_standardized NK
-        company_url string
-        verified_employer boolean
-        effective_date datetime
-        end_date datetime
-        is_current boolean
+        INTEGER company_sk
+        VARCHAR company_name_standardized
+        VARCHAR company_url
+        BOOLEAN verified_employer
+        TIMESTAMP effective_date
+        TIMESTAMP end_date
+        BOOLEAN is_current
     }
 
     DimLocation {
-        location_sk PK
-        province string
-        city string
-        district string
-        effective_date datetime
-        end_date datetime
-        is_current boolean
+        INTEGER location_sk
+        VARCHAR province
+        VARCHAR city
+        VARCHAR district
+        TIMESTAMP effective_date
+        TIMESTAMP end_date
+        BOOLEAN is_current
     }
 
     FactJobPostingDaily {
-        fact_id PK
-        job_sk FK
-        company_sk FK
-        date_id FK
-        salary_min decimal
-        salary_max decimal
-        salary_type string
-        due_date date
-        time_remaining int
-        verified_employer boolean
-        posted_time datetime
-        crawled_at datetime
-        load_month string
+        INTEGER fact_id
+        INTEGER job_sk
+        INTEGER company_sk
+        DATE date_id
+        DECIMAL salary_min
+        DECIMAL salary_max
+        VARCHAR salary_type
+        DATE due_date
+        INTEGER time_remaining
+        BOOLEAN verified_employer
+        TIMESTAMP posted_time
+        TIMESTAMP crawled_at
+        VARCHAR load_month
     }
 
     FactJobLocationBridge {
-        fact_id FK
-        location_sk FK
+        INTEGER fact_id
+        INTEGER location_sk
     }
 ```
 
@@ -241,11 +241,35 @@ erDiagram
 | **FactJobPostingDaily** | fact_id (INTEGER) | job_sk+date_id | - | Daily job posting facts |
 | **FactJobLocationBridge** | fact_id+location_sk | - | - | Many-to-many job-location relationship |
 
-### **3.2.2 Key Relationships**
-- **One Job** can have **multiple daily facts** (1:N)
-- **One Company** can have **multiple jobs** (1:N)
-- **One Job** can have **multiple locations** (M:N via bridge)
-- **One Location** can have **multiple jobs** (M:N via bridge)
+### **3.2.2 Key Constraints**
+
+| Table | Column | Constraint | Description |
+|-------|--------|------------|-------------|
+| **DimJob** | job_sk | PRIMARY KEY | Auto-generated surrogate key |
+| | job_id | UNIQUE (where is_current=TRUE) | Business natural key |
+| | is_current | NOT NULL, DEFAULT TRUE | SCD Type 2 flag |
+| **DimCompany** | company_sk | PRIMARY KEY | Auto-generated surrogate key |
+| | company_name_standardized | UNIQUE (where is_current=TRUE) | Business natural key |
+| | is_current | NOT NULL, DEFAULT TRUE | SCD Type 2 flag |
+| **FactJobPostingDaily** | fact_id | PRIMARY KEY | Auto-generated surrogate key |
+| | job_sk, date_id | UNIQUE | Business key combination |
+| | job_sk | FOREIGN KEY → DimJob.job_sk | Reference to job dimension |
+| | company_sk | FOREIGN KEY → DimCompany.company_sk | Reference to company dimension |
+| **FactJobLocationBridge** | fact_id, location_sk | PRIMARY KEY | Composite primary key |
+| | fact_id | FOREIGN KEY → FactJobPostingDaily.fact_id | Reference to fact table |
+| | location_sk | FOREIGN KEY → DimLocation.location_sk | Reference to location dimension |
+
+### **3.2.3 Entity Relationships**
+- **DimJob → FactJobPostingDaily**: One-to-Many (1:N)
+  - One job can have multiple daily fact records
+- **DimCompany → FactJobPostingDaily**: One-to-Many (1:N)
+  - One company can have multiple job postings
+- **FactJobPostingDaily → FactJobLocationBridge**: One-to-Many (1:N)
+  - One fact record can have multiple locations
+- **DimLocation → FactJobLocationBridge**: One-to-Many (1:N)
+  - One location can be associated with multiple jobs
+- **Job ↔ Location**: Many-to-Many (M:N)
+  - Resolved through FactJobLocationBridge table
 
 ### **3.3 Processing Workflow**
 
