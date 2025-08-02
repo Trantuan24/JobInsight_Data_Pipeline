@@ -6,7 +6,7 @@ from src.utils.config import Config
 from src.utils.path_helpers import ensure_path, ensure_dir, get_timestamp_filename
 from src.utils.user_agent_manager import UserAgentManager
 from src.utils.cleanup import cleanup_all_temp_files, cleanup_html_backups, cleanup_cdc_files
-from src.utils.retry import retry, async_retry, RetryManager
+from src.utils.retry import retry, async_retry
 
 __all__ = [
     # Logger
@@ -37,6 +37,5 @@ __all__ = [
     
     # Retry utilities
     'retry',
-    'async_retry',
-    'RetryManager'
+    'async_retry'
 ]

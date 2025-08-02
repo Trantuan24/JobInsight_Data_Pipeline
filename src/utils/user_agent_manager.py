@@ -59,9 +59,12 @@ class UserAgentManager:
             str: User-Agent string
         """
         if device_type is None:
-            # 70% desktop, 30% mobile nếu không chỉ định
-            all_agents = self.desktop_agents * 7 + self.mobile_agents * 3
-            return random.choice(all_agents)
+            # 80% desktop, 20% mobile để giảm detection (mobile dễ bị phát hiện hơn)
+            # Thêm randomness cao hơn để tránh pattern
+            if random.random() < 0.8:
+                return random.choice(self.desktop_agents) if self.desktop_agents else ""
+            else:
+                return random.choice(self.mobile_agents) if self.mobile_agents else ""
         elif device_type.lower() == 'desktop':
             return random.choice(self.desktop_agents) if self.desktop_agents else ""
         elif device_type.lower() == 'mobile':
@@ -85,18 +88,33 @@ class UserAgentManager:
     
     def get_viewport(self, user_agent):
         """
-        Lấy viewport size phù hợp với User-Agent
-        
+        Lấy viewport size phù hợp với User-Agent với randomization để tránh fingerprinting
+
         Args:
             user_agent: User-Agent string
-            
+
         Returns:
             dict: Viewport size {'width': width, 'height': height}
         """
         if self.is_mobile(user_agent):
-            return {'width': 390, 'height': 844}  # iPhone 12/13 size
+            # Random mobile viewport sizes để tránh detection
+            mobile_sizes = [
+                {'width': 390, 'height': 844},  # iPhone 12/13
+                {'width': 414, 'height': 896},  # iPhone 11/XR
+                {'width': 375, 'height': 812},  # iPhone X/XS
+                {'width': 360, 'height': 800},  # Samsung Galaxy
+            ]
+            return random.choice(mobile_sizes)
         else:
-            return {'width': 1366, 'height': 768}  # Common desktop size
+            # Random desktop viewport sizes để tránh detection
+            desktop_sizes = [
+                {'width': 1920, 'height': 1080},  # Full HD
+                {'width': 1366, 'height': 768},   # Common laptop
+                {'width': 1440, 'height': 900},   # MacBook
+                {'width': 1536, 'height': 864},   # Surface
+                {'width': 1280, 'height': 720},   # HD
+            ]
+            return random.choice(desktop_sizes)
     
     def _add_default_desktop_agents(self):
         """Thêm các desktop User-Agent mặc định"""

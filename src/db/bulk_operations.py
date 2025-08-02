@@ -135,9 +135,10 @@ class DBBulkOperations:
             
             # Bắt đầu transaction
             with conn.cursor() as cur:
-                # Chuẩn bị dữ liệu để copy
+                # Chuẩn bị dữ liệu để copy với proper escaping
                 output = io.StringIO()
-                df.to_csv(output, sep='\t', header=False, index=False, quoting=csv.QUOTE_MINIMAL)
+                df.to_csv(output, sep='\t', header=False, index=False,
+                         quoting=csv.QUOTE_NONNUMERIC, escapechar='\\')
                 output.seek(0)
             
                 # Tạo mệnh đề COPY với tên cột
@@ -210,9 +211,10 @@ class DBBulkOperations:
                     AS SELECT * FROM {full_table_name} WHERE 1=0
                 """)
                 
-                # 2. Copy dữ liệu vào bảng tạm
+                # 2. Copy dữ liệu vào bảng tạm với proper escaping
                 output = io.StringIO()
-                df.to_csv(output, sep='\t', header=False, index=False, quoting=csv.QUOTE_MINIMAL)
+                df.to_csv(output, sep='\t', header=False, index=False,
+                         quoting=csv.QUOTE_NONNUMERIC, escapechar='\\')
                 output.seek(0)
                 
                 columns = ", ".join([f'"{col}"' for col in df.columns])
