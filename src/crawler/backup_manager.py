@@ -24,7 +24,7 @@ try:
     from src.utils.retry import async_retry
     from src.utils.user_agent_manager import UserAgentManager
     from src.crawler.captcha_handler import CaptchaHandler
-    from src.crawler.crawler_utils import log_action
+
     from playwright.async_api import async_playwright
 except ImportError:
     import logging
@@ -32,29 +32,14 @@ except ImportError:
     def get_logger(name):
         return logging.getLogger(name)
     
-    # Fallback cho log_action
-    def log_action(action, page_num, level="info", **kwargs):
-        logger = logging.getLogger("crawler")
-        msg = f"Action: {action}, Page: {page_num}"
-        if kwargs:
-            msg += f", {', '.join([f'{k}={v}' for k, v in kwargs.items()])}"
-        if level == "info":
-            logger.info(msg)
-        elif level == "warning":
-            logger.warning(msg)
-        elif level == "error":
-            logger.error(msg)
-        elif level == "success":
-            logger.info(f"SUCCESS: {msg}")
-    
     # Fallback Config & path_helpers
     class Config:
         class Crawler:
             BASE_URL = "https://www.topcv.vn/viec-lam-it"
             PAGE_LOAD_TIMEOUT = 60000
             SELECTOR_TIMEOUT = 20000
-            MIN_DELAY = 4
-            MAX_DELAY = 8
+            MIN_DELAY = 3  # Giảm từ 6s xuống 3s để tăng tốc
+            MAX_DELAY = 6  # Giảm từ 10s xuống 6s để tăng tốc
             MAX_RETRY = 3
             RETRY_DELAYS = [2, 4, 8]
         class Dirs:
@@ -123,8 +108,8 @@ class HTMLBackupManager:
         
         # Config đa luồng
         self.max_workers = self.config.get('max_workers', Config.Threading.MAX_WORKERS)
-        self.concurrent_backups = self.config.get('concurrent_backups', 
-                                                min(5, (os.cpu_count() or 1) * 2))
+        self.concurrent_backups = self.config.get('concurrent_backups',
+                                                min(5, max(3, (os.cpu_count() or 1))))
         
         # Backup directory - sử dụng pathlib.Path
         self.backup_dir = ensure_dir(self.config.get('backup_dir', Config.Dirs.BACKUP_DIR))
@@ -234,27 +219,33 @@ class HTMLBackupManager:
     async def backup_single_page(self, page_num: int) -> Dict[str, Any]:
         """
         Backup HTML của một trang với session mới và retry logic
-        
+
         Args:
             page_num: Số trang cần backup
-            
+
         Returns:
             Dict: Kết quả backup {'success': bool, 'filename': str, 'page': int, ...}
         """
+        # Random delay trước mỗi page để tránh pattern detection
+        if page_num > 1:  # Không delay cho page đầu tiên
+            pre_delay = random.uniform(1, 3)  # 1-3 giây random delay
+            await asyncio.sleep(pre_delay)
+
         # Lấy random user-agent và viewport
         user_agent = self.ua_manager.get_random_agent()
         viewport = self.ua_manager.get_viewport(user_agent)
-        
+
         try:
             # Sử dụng hàm đã được wrap với retry decorator
             return await self._backup_page_impl(page_num, user_agent, viewport)
         except Exception as e:
-            error_msg = str(e)
+            error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"Failed to backup page {page_num} after retries: {error_msg}")
             logger.debug(traceback.format_exc())
             return {
-                "success": False, 
+                "success": False,
                 "error": error_msg,
+                "error_type": type(e).__name__,
                 "page": page_num
             }
     
@@ -316,19 +307,29 @@ class HTMLBackupManager:
         processed_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Error backing up page {i+1}: {str(result)}")
+                error_msg = f"{type(result).__name__}: {str(result)}"
+                logger.error(f"Error backing up page {i+1}: {error_msg}")
                 logger.debug(traceback.format_exc())
                 processed_results.append({
                     "success": False,
-                    "error": str(result),
+                    "error": error_msg,
+                    "error_type": type(result).__name__,
                     "page": i+1
                 })
             else:
                 processed_results.append(result)
         
         successful = sum(1 for r in processed_results if r.get("success", False))
+        failed = num_pages - successful
+
+        # Circuit Breaker: Nếu quá nhiều pages bị block, pause để tránh bị ban
+        if failed >= 3 and num_pages >= 4:  # Nếu >= 3 pages fail trong batch >= 4 pages
+            logger.warning(f"Circuit Breaker triggered: {failed}/{num_pages} pages failed. Pausing 5 minutes to avoid IP ban...")
+            await asyncio.sleep(300)  # Pause 5 minutes
+            logger.info("Circuit Breaker: Resuming after pause")
+
         logger.info(f"Parallel backup completed: {successful}/{num_pages} pages successful")
-        
+
         return processed_results
     
     async def backup_html_pages(self, num_pages=5, parallel=True) -> List[Dict[str, Any]]:
@@ -348,53 +349,4 @@ class HTMLBackupManager:
             return await self.backup_html_pages_sequential(num_pages)
 
 
-# Test the class if run directly
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_backup():
-        backup_manager = HTMLBackupManager()
-        
-        # Test backup một trang
-        print("Testing backup single page...")
-        result = await backup_manager.backup_single_page(1)
-        print(f"Single page result: {result}")
-        
-        # Test backup song song
-        print("\nTesting parallel backup...")
-        results = await backup_manager.backup_html_pages(3, parallel=True)
-        print(f"Parallel backup results: {len(results)} results")
-        for r in results:
-            print(f"  Page {r.get('page')}: {'Success' if r.get('success') else 'Failed'}")
-    
-    # Chạy trong event loop
-    asyncio.run(test_backup())
-
-# Legacy wrapper functions để đảm bảo tương thích với code cũ
-async def backup_single_page(page_num):
-    """
-    Hàm wrapper tương thích với code cũ, gọi đến backup_manager
-    
-    Args:
-        page_num: Số trang cần backup
-        
-    Returns:
-        Dict: Kết quả backup
-    """
-    backup_manager = HTMLBackupManager()
-    result = await backup_manager.backup_single_page(page_num)
-    return result
-
-async def backup_html_pages(num_pages=5):
-    """
-    Hàm wrapper tương thích với code cũ, gọi đến backup_manager
-    
-    Args:
-        num_pages: Số trang cần backup
-        
-    Returns:
-        List[Dict]: Kết quả backup
-    """
-    backup_manager = HTMLBackupManager()
-    results = await backup_manager.backup_html_pages(num_pages, parallel=True)
-    return results 
+# Production module - test code removed

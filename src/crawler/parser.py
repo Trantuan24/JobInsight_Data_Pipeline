@@ -99,12 +99,21 @@ class TopCVParser:
                 20, (os.cpu_count() or 1) * 4
             )
         
-        # Thread-safe để tracking processed job IDs
+        # Thread-safe để tracking processed job IDs với memory management
         self._job_id_processed: Set[str] = set()
         self._job_data_lock = threading.Lock()
+        self._max_processed_ids = 10000  # Limit để tránh memory leak
         
         logger.info(f"Khởi tạo TopCVParser với backup_dir: {self.backup_dir}, max_workers: {self.max_workers}")
-    
+
+    def _cleanup_processed_ids(self):
+        """Clean up processed IDs set để tránh memory leak"""
+        current_size = len(self._job_id_processed)
+        if current_size > self._max_processed_ids:
+            logger.info(f"Memory cleanup triggered: processed IDs set size {current_size} > {self._max_processed_ids}")
+            self._job_id_processed.clear()
+            logger.info("Processed IDs set cleared to prevent memory leak")
+
     def find_html_files(self) -> List[Path]:
         """
         Tìm các file HTML trong thư mục backup
@@ -149,21 +158,33 @@ class TopCVParser:
                 try:
                     # Extract job data từ HTML element
                     job_data = self.extract_job_data(job_item)
-                    
+
+                    # Debug logging để hiểu parse failures
+                    if not job_data['job_id']:
+                        logger.debug(f"Job item missing job_id in {html_file.name}")
+                    elif not job_data['title']:
+                        logger.debug(f"Job item missing title for job_id {job_data['job_id']} in {html_file.name}")
+
                     if job_data['job_id'] and job_data['title']:
                         # Thêm vào danh sách job đã parse
                         with self._job_data_lock:
                             if job_data['job_id'] not in self._job_id_processed:
                                 self._job_id_processed.add(job_data['job_id'])
                                 parsed_jobs.append(job_data)
+
+                                # Cleanup nếu set quá lớn
+                                if len(self._job_id_processed) > self._max_processed_ids:
+                                    self._cleanup_processed_ids()
+                    else:
+                        logger.debug(f"Skipped job item: job_id={job_data.get('job_id')}, title={job_data.get('title')[:50] if job_data.get('title') else None}")
                         
                 except Exception as e:
-                    logger.error(f"Error parsing job item in {html_file.name}: {str(e)}")
+                    logger.error(f"Error parsing job item in {html_file.name}: {type(e).__name__}: {str(e)}")
                     logger.debug(traceback.format_exc())
                     continue
-            
+
         except Exception as e:
-            logger.error(f"Error parsing file {html_file}: {str(e)}")
+            logger.error(f"Error parsing file {html_file}: {type(e).__name__}: {str(e)}")
             logger.debug(traceback.format_exc())
             
         return parsed_jobs
@@ -247,7 +268,11 @@ class TopCVParser:
                 if tooltip:
                     # Tạo một soup mới để parse tooltip HTML
                     tooltip_soup = BeautifulSoup(tooltip, 'html.parser')
-                    job_data['location_detail'] = tooltip_soup.get_text(strip=True)
+                    location_detail = tooltip_soup.get_text(strip=True)
+                    # Clean up potential CSV-breaking characters
+                    location_detail = location_detail.replace('\n', ' ').replace('\r', ' ')
+                    location_detail = ' '.join(location_detail.split())  # Normalize whitespace
+                    job_data['location_detail'] = location_detail
             
             # Nếu không có tooltip hoặc không parse được, sử dụng location
             if 'location_detail' not in job_data or not job_data['location_detail']:
@@ -282,7 +307,12 @@ class TopCVParser:
                 if skill_text.endswith('+') and skill.has_attr('data-original-title'):
                     additional_skills = skill['data-original-title']
                     if additional_skills and not additional_skills.startswith('<'):
-                        skills.append(additional_skills)
+                        # Split multiple skills by comma và clean up
+                        if ',' in additional_skills:
+                            split_skills = [s.strip() for s in additional_skills.split(',')]
+                            skills.extend(split_skills)
+                        else:
+                            skills.append(additional_skills)
                 else:
                     skills.append(skill_text)
         else:
@@ -343,8 +373,34 @@ class TopCVParser:
             posted_time = datetime.now().timestamp() - seconds_ago
             job_data['posted_time'] = datetime.fromtimestamp(posted_time).isoformat()
         
+        # Validate và clean data trước khi return
+        return self._validate_job_data(job_data)
+
+    def _validate_job_data(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate và clean job data để tránh CSV issues"""
+        # Clean string fields để remove potential CSV-breaking characters
+        string_fields = ['title', 'company_name', 'salary', 'location', 'location_detail', 'last_update']
+        for field in string_fields:
+            if job_data.get(field):
+                # Remove newlines và normalize whitespace
+                cleaned = str(job_data[field]).replace('\n', ' ').replace('\r', ' ')
+                # Replace semicolons with commas để tránh CSV parsing issues
+                cleaned = cleaned.replace(';', ',')
+                job_data[field] = ' '.join(cleaned.split())
+
+        # Ensure skills is properly formatted list
+        if job_data.get('skills') and isinstance(job_data['skills'], list):
+            # Clean individual skills
+            cleaned_skills = []
+            for skill in job_data['skills']:
+                if skill and isinstance(skill, str):
+                    cleaned_skill = skill.strip().replace('\n', ' ').replace('\r', ' ')
+                    if cleaned_skill:  # Only add non-empty skills
+                        cleaned_skills.append(cleaned_skill)
+            job_data['skills'] = cleaned_skills
+
         return job_data
-    
+
     def parse_multiple_files(self, html_files: List[Union[str, Path]] = None) -> pd.DataFrame:
         """
         Parse nhiều file HTML và trả về DataFrame.
@@ -383,7 +439,7 @@ class TopCVParser:
                     else:
                         logger.warning(f"No jobs parsed from {os.path.basename(str(file))}")
                 except Exception as e:
-                    logger.error(f"Error processing {file}: {str(e)}")
+                    logger.error(f"Error processing {file}: {type(e).__name__}: {str(e)}")
                     logger.debug(traceback.format_exc())
         
         # Chuyển sang DataFrame
@@ -414,30 +470,3 @@ class TopCVParser:
         
         logger.warning("No valid job data parsed from any HTML files")
         return pd.DataFrame()
-
-
-def parse_html_files():
-    """Legacy function cho backward compatibility"""
-    parser = TopCVParser()
-    df = parser.parse_multiple_files()
-    
-    if not df.empty:
-        logger.info(f"Parsed {len(df)} jobs successfully")
-        return df
-    else:
-        logger.warning("No jobs parsed")
-        return pd.DataFrame()
-
-
-# Test the class if run directly
-if __name__ == "__main__":
-    parser = TopCVParser()
-    df = parser.parse_multiple_files()
-    
-    if not df.empty:
-        print(f"Parsed {len(df)} jobs successfully")
-        # Print first job as sample
-        print("\nSample job:")
-        sample_job = df.iloc[0].to_dict()
-        for key, value in sample_job.items():
-            print(f"{key}: {value}") 

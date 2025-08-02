@@ -62,17 +62,29 @@ class TopCVCrawler:
         self.parser = TopCVParser()
         self.db_ops = DBBulkOperations()
         
-        # Config crawl
-        self.num_pages = self.config.get('num_pages', 5)
+        # Config crawl với validation
+        self.num_pages = self._validate_num_pages(self.config.get('num_pages', 5))
         self.use_parallel = self.config.get('use_parallel', True)
-        self.db_table = self.config.get('db_table', 'raw_jobs')
+        self.db_table = self._validate_db_table(self.config.get('db_table', 'raw_jobs'))
         self.db_schema = self.config.get('db_schema', None)
         self.enable_cdc = self.config.get('enable_cdc', True)  # Mặc định bật CDC
         
-        logger.info(f"Khởi tạo TopCVCrawler với {self.num_pages} trang, " + 
+        logger.info(f"Khởi tạo TopCVCrawler với {self.num_pages} trang, " +
                     f"{'đa luồng' if self.use_parallel else 'tuần tự'}, " +
                     f"{'có CDC' if self.enable_cdc else 'không CDC'}")
-    
+
+    def _validate_num_pages(self, num_pages):
+        """Validate số trang crawl"""
+        if not isinstance(num_pages, int) or num_pages < 1 or num_pages > 50:
+            raise ValueError(f"num_pages phải là integer từ 1-50, nhận được: {num_pages}")
+        return num_pages
+
+    def _validate_db_table(self, db_table):
+        """Validate tên bảng database"""
+        if not isinstance(db_table, str) or not db_table.strip():
+            raise ValueError(f"db_table phải là string không rỗng, nhận được: {db_table}")
+        return db_table.strip()
+
     async def crawl(self, num_pages=None) -> Dict[str, Any]:
         """
         Thực hiện toàn bộ quy trình crawl
@@ -236,20 +248,6 @@ class TopCVCrawler:
         crawler = cls(config)
         return asyncio.run(crawler.crawl(num_pages))
 
-
-# Các hàm wrapper để tương thích với code cũ
-async def backup_html_pages(num_pages=5):
-    """
-    Hàm wrapper tương thích với code cũ, chỉ gọi backup_manager
-    
-    Args:
-        num_pages: Số trang cần backup
-        
-    Returns:
-        List[Dict]: Kết quả backup
-    """
-    backup_manager = HTMLBackupManager()
-    return await backup_manager.backup_html_pages(num_pages)
 
 
 # Test functionality if run directly

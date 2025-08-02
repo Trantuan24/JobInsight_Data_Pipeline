@@ -16,19 +16,7 @@ except ImportError:
 
 logger = get_logger("crawler.utils")
 
-def log_action(action, page_num=None, status="success", error=None, attempt=1, user_agent=None):
-    """Log mỗi hành động dưới dạng JSON"""
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "action": action,
-        "page": page_num,
-        "status": status,
-        "attempt": attempt,
-        "user_agent": user_agent,
-        "error": str(error) if error else None
-    }
-    logger.info(json.dumps(log_entry))
-    return log_entry
+# log_action function removed - not used in current implementation
 
 def parse_last_update(update_text):
     """Phân tích chuỗi ngày cập nhật và chuyển đổi thành số giây"""

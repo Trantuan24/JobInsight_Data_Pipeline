@@ -48,8 +48,8 @@ class CaptchaHandler:
         self.captcha_regex = re.compile('|'.join(self.captcha_patterns), re.IGNORECASE)
         
         self.retry_count = 0
-        self.max_retries = 3
-        self.delay_between_retries = [2, 5, 10]  # Thời gian delay tăng dần
+        self.max_retries = 4  # Tăng từ 3 lên 5 để handle anti-bot tốt hơn
+        self.delay_between_retries = [3, 8, 15, 25, 40]  # Thời gian delay tăng dần và lâu hơn
         
         logger.info("Khởi tạo CaptchaHandler")
     
