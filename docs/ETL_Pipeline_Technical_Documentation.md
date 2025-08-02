@@ -177,59 +177,75 @@ erDiagram
     DimLocation ||--o{ FactJobLocationBridge : "location_sk"
     FactJobPostingDaily ||--o{ FactJobLocationBridge : "fact_id"
     DimDate ||--o{ FactJobPostingDaily : "date_id"
-    
+
     DimJob {
-        int job_sk PK
-        string job_id NK
-        string title_clean
-        text skills
-        string job_url
-        datetime effective_date
-        datetime end_date
-        boolean is_current
+        job_sk PK
+        job_id NK
+        title_clean string
+        skills text
+        job_url string
+        effective_date datetime
+        end_date datetime
+        is_current boolean
     }
-    
+
     DimCompany {
-        int company_sk PK
-        string company_name_standardized NK
-        string company_url
-        boolean verified_employer
-        datetime effective_date
-        datetime end_date
-        boolean is_current
+        company_sk PK
+        company_name_standardized NK
+        company_url string
+        verified_employer boolean
+        effective_date datetime
+        end_date datetime
+        is_current boolean
     }
-    
+
     DimLocation {
-        int location_sk PK
-        string province
-        string city
-        string district
-        datetime effective_date
-        datetime end_date
-        boolean is_current
+        location_sk PK
+        province string
+        city string
+        district string
+        effective_date datetime
+        end_date datetime
+        is_current boolean
     }
-    
+
     FactJobPostingDaily {
-        int fact_id PK
-        int job_sk FK
-        int company_sk FK
-        date date_id FK
-        decimal salary_min
-        decimal salary_max
-        string salary_type
-        date due_date
-        int time_remaining
-        boolean verified_employer
-        datetime posted_time
-        datetime crawled_at
-        string load_month
+        fact_id PK
+        job_sk FK
+        company_sk FK
+        date_id FK
+        salary_min decimal
+        salary_max decimal
+        salary_type string
+        due_date date
+        time_remaining int
+        verified_employer boolean
+        posted_time datetime
+        crawled_at datetime
+        load_month string
     }
-    
+
     FactJobLocationBridge {
-        int fact_id FK
-        int location_sk FK
+        fact_id FK
+        location_sk FK
     }
 ```
+
+### **3.2.1 Table Specifications**
+
+| Table | Primary Key | Natural Key | SCD Type | Description |
+|-------|-------------|-------------|----------|-------------|
+| **DimJob** | job_sk (INTEGER) | job_id (VARCHAR) | Type 2 | Job dimension with version history |
+| **DimCompany** | company_sk (INTEGER) | company_name_standardized (VARCHAR) | Type 2 | Company dimension with version history |
+| **DimLocation** | location_sk (INTEGER) | province+city+district | Type 2 | Location dimension hierarchy |
+| **FactJobPostingDaily** | fact_id (INTEGER) | job_sk+date_id | - | Daily job posting facts |
+| **FactJobLocationBridge** | fact_id+location_sk | - | - | Many-to-many job-location relationship |
+
+### **3.2.2 Key Relationships**
+- **One Job** can have **multiple daily facts** (1:N)
+- **One Company** can have **multiple jobs** (1:N)
+- **One Job** can have **multiple locations** (M:N via bridge)
+- **One Location** can have **multiple jobs** (M:N via bridge)
 
 ### **3.3 Processing Workflow**
 
