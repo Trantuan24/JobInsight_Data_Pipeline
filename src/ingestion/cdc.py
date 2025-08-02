@@ -10,41 +10,81 @@ import filelock
 # Import modules
 try:
     from src.utils.logger import get_logger
-    from src.ingestion.cdc_utils import get_cdc_filepath, prepare_cdc_record, CDC_DIR
     from src.utils.path_helpers import ensure_path, ensure_dir
-    from src.common.decorators import retry
+    from src.utils.retry import retry
 except ImportError:
     import logging
     logging.basicConfig(level=logging.INFO)
     def get_logger(name):
         return logging.getLogger(name)
-    from src.ingestion.cdc_utils import get_cdc_filepath, prepare_cdc_record, CDC_DIR
-    from src.utils.path_helpers import ensure_path, ensure_dir
-    # Fallback cho retry decorator
+
+    # Fallback path helpers
+    def ensure_path(path):
+        from pathlib import Path
+        return Path(path) if isinstance(path, str) else path
+
+    def ensure_dir(path):
+        dir_path = ensure_path(path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path
+
+    # Fallback retry decorator
     def retry(max_tries=3, delay_seconds=1.0, **kwargs):
         def decorator(func):
             return func
         return decorator
 
+# CDC Configuration
+CDC_DIR = ensure_dir(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "cdc"))
+
 logger = get_logger("ingestion.cdc")
 
-@retry(max_tries=3, delay_seconds=1.0, backoff_factor=2.0, logger=logger, 
+def get_cdc_filepath(timestamp: datetime) -> str:
+    """Get CDC file path based on timestamp"""
+    date_str = timestamp.strftime("%Y%m%d")
+    year_month = timestamp.strftime("%Y%m")
+
+    # Create directory structure: CDC_DIR/YYYYMM/YYYYMMDD/
+    day_dir = ensure_dir(CDC_DIR / year_month / date_str)
+
+    # File name: cdc_YYYYMMDD.jsonl
+    filename = f"cdc_{date_str}.jsonl"
+    return str(day_dir / filename)
+
+def prepare_cdc_record(job_id: str, action: str, data: Dict[str, Any]) -> Tuple[Dict[str, Any], datetime]:
+    """Prepare CDC record for saving"""
+    timestamp = datetime.now()
+
+    cdc_record = {
+        "timestamp": timestamp.isoformat(),
+        "job_id": job_id,
+        "action": action,
+        "data": data,
+        "metadata": {
+            "source": "crawler",
+            "version": "1.0"
+        }
+    }
+
+    return cdc_record, timestamp
+
+@retry(max_tries=3, delay_seconds=1.0, backoff_factor=2.0,
        exceptions=[IOError, filelock.Timeout])
 def save_cdc_record(job_id: str, action: str, data: Dict[str, Any]):
     """Lưu CDC record vào file JSONL để phục vụ recovery"""
-    # Sử dụng hàm từ cdc_utils
+    # Prepare CDC record
     cdc_record, timestamp = prepare_cdc_record(job_id, action, data)
-    
-    # Lấy đường dẫn file từ cdc_utils
+
+    # Get file path
     cdc_file = get_cdc_filepath(timestamp)
     
     try:
         # Sử dụng file locking để xử lý concurrency
         with filelock.FileLock(f"{cdc_file}.lock", timeout=10):
-            # Ghi file với mode append để không mất dữ liệu cũ
+            # Optimize I/O: combine json serialization và write trong single operation
+            json_line = json.dumps(cdc_record, ensure_ascii=False, default=str) + '\n'
             with open(cdc_file, 'a', encoding='utf-8') as f:
-                json.dump(cdc_record, f, ensure_ascii=False, default=str)
-                f.write('\n')
+                f.write(json_line)
             
         logger.debug(f"Đã lưu CDC record cho job {job_id}, action={action}")
         return True
@@ -52,9 +92,14 @@ def save_cdc_record(job_id: str, action: str, data: Dict[str, Any]):
         logger.error(f"Lỗi lưu CDC record cho job {job_id}: {str(e)}")
         return False
 
-@retry(max_tries=2, delay_seconds=1.0, logger=logger, exceptions=[IOError, json.JSONDecodeError])
+@retry(max_tries=2, delay_seconds=1.0, exceptions=[IOError, json.JSONDecodeError])
 def replay_cdc_file(cdc_file_path: str):
-    """Replay CDC file để recovery data"""
+    """
+    DEPRECATED: Replay CDC file để recovery data
+
+    WARNING: Function này không được sử dụng trong luồng hiện tại và sẽ bị loại bỏ.
+    Chỉ giữ lại để tương thích với docs và có thể sử dụng trong tương lai.
+    """
     logger.info(f"Replaying CDC file: {cdc_file_path}")
     
     if not os.path.exists(cdc_file_path):
@@ -95,7 +140,12 @@ def replay_cdc_file(cdc_file_path: str):
     return stats
 
 def list_cdc_files(days_back: int = 7) -> List[str]:
-    """Liệt kê các CDC files trong khoảng thời gian nhất định"""
+    """
+    DEPRECATED: Liệt kê các CDC files trong khoảng thời gian nhất định
+
+    WARNING: Function này không được sử dụng trong luồng hiện tại và sẽ bị loại bỏ.
+    Chỉ giữ lại để tương thích với docs và có thể sử dụng trong tương lai.
+    """
     result = []
     
     # Tính toán các ngày cần kiểm tra
@@ -121,7 +171,7 @@ def list_cdc_files(days_back: int = 7) -> List[str]:
     
     return sorted(result) 
 
-@retry(max_tries=2, delay_seconds=2.0, logger=logger, exceptions=[IOError, OSError, shutil.Error])
+@retry(max_tries=2, delay_seconds=2.0, exceptions=[IOError, OSError, shutil.Error])
 def cleanup_old_cdc_files(days_to_keep: int = 30) -> Dict[str, int]:
     """
     Xóa các file CDC cũ hơn số ngày chỉ định
@@ -209,97 +259,7 @@ def cleanup_old_cdc_files(days_to_keep: int = 30) -> Dict[str, int]:
         
     return stats
 
-# Thêm class CDC_Handler từ cdc_handler.py
-class CDC_Handler:
-    """
-    Class quản lý tập trung các thao tác CDC (Change Data Capture)
-    - Đảm bảo ghi log CDC khi có thay đổi dữ liệu
-    - Cung cấp interface đơn giản cho các module khác
-    """
-    
-    def __init__(self):
-        """Khởi tạo CDC_Handler"""
-        # Đảm bảo thư mục CDC tồn tại
-        self.cdc_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "cdc")
-        ensure_dir(self.cdc_dir)
-        logger.info(f"Khởi tạo CDC_Handler với thư mục: {self.cdc_dir}")
-    
-    def log_record(self, job_id: str, action: str, data: Dict[str, Any]) -> bool:
-        """
-        Ghi log CDC cho một record
-        
-        Args:
-            job_id: ID của job
-            action: Loại hành động (insert, update, delete)
-            data: Dữ liệu của record
-            
-        Returns:
-            bool: True nếu thành công
-        """
-        logger.debug(f"Ghi CDC record cho job {job_id}, action={action}")
-        
-        try:
-            # Sử dụng hàm save_cdc_record từ module cdc
-            success = save_cdc_record(job_id, action, data)
-            if success:
-                logger.debug(f"Đã lưu CDC record thành công cho job {job_id}")
-            else:
-                logger.warning(f"Lưu CDC record không thành công cho job {job_id}")
-            return success
-            
-        except Exception as e:
-            logger.error(f"Lỗi khi ghi CDC record cho job {job_id}: {str(e)}")
-            return False
-    
-    def log_batch(self, records: List[Dict[str, Any]], action: str) -> Dict[str, int]:
-        """
-        Ghi log CDC cho một batch records
-        
-        Args:
-            records: Danh sách các record
-            action: Loại hành động (insert, update, delete)
-            
-        Returns:
-            Dict[str, int]: Thống kê kết quả {'total': int, 'success': int, 'failed': int}
-        """
-        stats = {'total': len(records), 'success': 0, 'failed': 0}
-        
-        if not records:
-            logger.warning("Không có records để lưu CDC")
-            return stats
-        
-        logger.info(f"Bắt đầu ghi CDC cho {len(records)} records, action={action}")
-        
-        for record in records:
-            job_id = record.get('job_id')
-            
-            if not job_id:
-                logger.warning(f"Record không có job_id, bỏ qua: {record}")
-                stats['failed'] += 1
-                continue
-            
-            success = self.log_record(job_id, action, record)
-            
-            if success:
-                stats['success'] += 1
-            else:
-                stats['failed'] += 1
-        
-        logger.info(f"Hoàn thành ghi CDC: {stats['success']}/{stats['total']} thành công")
-        return stats
+# CDC_Handler class removed - use save_cdc_record function directly
 
 
-# Singleton instance
-_instance = None
-
-def get_cdc_handler() -> CDC_Handler:
-    """
-    Lấy singleton instance của CDC_Handler
-    
-    Returns:
-        CDC_Handler: Instance của CDC_Handler
-    """
-    global _instance
-    if _instance is None:
-        _instance = CDC_Handler()
-    return _instance
+# CDC_Handler singleton removed - use save_cdc_record function directly
