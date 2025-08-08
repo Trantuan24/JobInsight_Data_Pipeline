@@ -1,7 +1,7 @@
 # JobInsight ETL Pipeline
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Trantuan24/JobInsight_Data_Pipeline)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-org/jobinsight/ci.yml?branch=main)](../../actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/Trantuan24/JobInsight_Data_Pipeline/ci.yml?branch=main)](../../actions)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Data Pipeline](https://img.shields.io/badge/pipeline-ETL-orange)](docs/System_Architecture_Overview.md)
@@ -195,7 +195,7 @@ python -c "import duckdb; conn=duckdb.connect('data/duck_db/jobinsight_warehouse
 ### **Development Setup**
 ```bash
 # 1. Clone repository
-git clone https://github.com/your-username/JobInsight_Data_Pipeline.git
+git clone https://github.com/Trantuan24/JobInsight_Data_Pipeline.git
 cd JobInsight_Data_Pipeline
 
 # 2. Create virtual environment
@@ -403,7 +403,7 @@ JobInsight_Data_Pipeline/
 
 ## Contributing
 
-We welcome contributions! Please follow these steps:
+Contributions are welcome! Please follow these steps:
 
 1. **Fork** the repository
 2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
@@ -420,8 +420,8 @@ We welcome contributions! Please follow these steps:
 
 ## License
 
-MIT © 2025 JobInsight Team
+MIT © 2025
 
 ---
 
-**Built with ❤️ for the Vietnamese job market intelligence community**
+**Built with ❤️ for Vietnamese job market intelligence**

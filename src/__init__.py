@@ -9,7 +9,7 @@ Dự án này bao gồm các thành phần chính:
 """
 
 __version__ = "1.0.0"
-__author__ = "JobInsight Team"
+__author__ = "Trantuan24"
 
 # Import các package chính
 from . import crawler
