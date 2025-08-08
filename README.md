@@ -153,7 +153,7 @@ graph TD
 ### **🚀 One-Command Setup**
 ```bash
 # Clone repository
-git clone https://github.com/your-username/JobInsight_Data_Pipeline.git
+git clone https://github.com/Trantuan24/JobInsight_Data_Pipeline.git
 cd JobInsight_Data_Pipeline
 
 # Setup environment
@@ -167,7 +167,6 @@ docker-compose up -d
 ### **🎯 Access Points**
 After containers start:
 - **Airflow UI**: http://localhost:8080 (admin/admin)
-- **Grafana Dashboard**: http://localhost:3001 (admin/admin)
 - **Database**: PostgreSQL on localhost:5432
 - **Data Warehouse**: DuckDB files in `data/duck_db/`
 
