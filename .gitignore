@@ -63,7 +63,8 @@ standalone_admin_password.txt
 
 ### Backup Files ###
 # File backup HTML từ quá trình crawling
-raw_backup/
+data/raw_backup/**/*
+!data/raw_backup/.gitkeep
 
 ### Data Directories ###
 # Chiến lược: Loại trừ nội dung nhưng giữ cấu trúc thư mục
