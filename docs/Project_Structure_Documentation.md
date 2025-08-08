@@ -142,7 +142,7 @@ Configuration is managed through environment variables và configuration files e
 
 | Component | File | Purpose | Dependencies |
 |-----------|------|---------|--------------|
-| **Crawler** | `crawler.py` | Main crawler implementation | Selenium, BeautifulSoup |
+| **Crawler** | `crawler.py` | Main crawler implementation | Playwright, BeautifulSoup |
 | **BackupManager** | `backup_manager.py` | HTML backup management | File I/O, threading |
 | **CaptchaHandler** | `captcha_handler.py` | Anti-detection logic | Custom algorithms |
 | **Parser** | `parser.py` | HTML parsing & extraction | Pandas, RegEx |
@@ -206,7 +206,7 @@ tests/
 ```mermaid
 graph TD
     subgraph "External Dependencies"
-        A[Selenium] --> B[Crawler]
+        A[Playwright] --> B[Crawler]
         C[Pandas] --> D[ETL Processing]
         E[DuckDB] --> F[Data Warehouse]
     end

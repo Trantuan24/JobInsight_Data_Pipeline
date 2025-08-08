@@ -84,7 +84,7 @@ graph TD
 ```
 
 ### **Technology Stack**
-- **Web Scraping**: Selenium + Chrome (anti-detection)
+- **Web Scraping**: Playwright + BeautifulSoup + Chromium (anti-detection)
 - **Processing**: Python + Pandas (data transformation)
 - **Storage**: PostgreSQL (raw/staging) + DuckDB (warehouse)
 - **Orchestration**: Apache Airflow (workflow management)

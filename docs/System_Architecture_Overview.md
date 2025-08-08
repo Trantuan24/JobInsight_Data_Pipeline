@@ -63,7 +63,7 @@ graph TD
 
 | Layer | Phase 1 | Phase 2 | Phase 3 | Purpose |
 |-------|---------|---------|---------|---------|
-| **Web Layer** | Selenium + Chrome | - | - | Anti-detection crawling |
+| **Web Layer** | Playwright + Chromium | - | - | Anti-detection crawling |
 | **Processing** | Python + Pandas | Python + Pandas | Python + Pandas | Data transformation |
 | **Storage** | PostgreSQL | PostgreSQL | DuckDB | Optimized for use case |
 | **Orchestration** | Airflow DAG | ETL Scripts | ETL Scripts | Workflow management |
