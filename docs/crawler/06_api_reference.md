@@ -53,26 +53,11 @@ async def crawl(self, num_pages=None)
 ```python
 {
     "success": bool,
-    "duration_seconds": float,  # seconds
-    "backup": {
-        "successful": int,
-        "total": int,
-        "results": List[Dict]
-    },
-    "parse": {
-        "total_jobs": int,
-        "successful_files": int
-    },
-    "database": {
-        "inserted": int,
-        "updated": int,
-        "failed": int
-    },
-    "cdc": {
-        "inserted": int,
-        "updated": int,
-        "failed": int
-    },
+    "execution_time": float,  # seconds
+    "backup": {"total": int, "successful": int, "failed": int},
+    "parse": {"total_jobs": int, "company_count": int, "location_count": int},
+    "database": {"inserted": int, "updated": int, "execution_time": float},
+    "cdc": {"inserted": int, "updated": int, "failed": int},
     "error": str  # if success=False
 }
 ```
@@ -230,10 +215,11 @@ Extracts structured data from HTML files.
 
 ```python
 class TopCVParser:
-    def __init__(self, max_workers: Optional[int] = None)
+    def __init__(self, backup_dir: Optional[Union[str, Path]] = None, max_workers: Optional[int] = None)
 ```
 
 **Parameters:**
+- `backup_dir` (str|Path, optional): Directory of HTML backups
 - `max_workers` (int, optional): ThreadPoolExecutor worker count
 
 #### Methods
@@ -254,11 +240,17 @@ def parse_multiple_files(self, html_files: List[Union[str, Path]]) -> pd.DataFra
 {
     'job_id': str,
     'title': str,
+    'job_url': str,
     'company_name': str,
-    'salary': str,
-    'skills': str,  # JSON string
+    'company_url': str,
+    'salary': str,           # JSON string
+    'skills': str,           # JSON string (list serialized)
     'location': str,
+    'location_detail': str,
     'deadline': str,
+    'verified_employer': bool,
+    'last_update': str,
+    'logo_url': str,
     'posted_time': datetime,
     'crawled_at': datetime
 }
@@ -311,6 +303,11 @@ class CaptchaHandler:
     def __init__(self)
 ```
 
+**Notes:**
+- Default `max_retries` = 4 with delays [3, 8, 15, 25, 40] seconds (plus small jitter)
+- Return keys use `retry` and `delay` as shown below
+
+
 #### Methods
 
 ##### `detect_captcha()`
@@ -349,8 +346,8 @@ async def handle_captcha(self, page) -> Tuple[bool, Dict[str, Any]]
 (
     success: bool,
     {
-        "retry_count": int,
-        "delay_applied": float,
+        "retry": int,
+        "delay": float,
         "error": str  # if success=False
     }
 )
@@ -406,10 +403,7 @@ def bulk_upsert(
     "success": bool,
     "inserted": int,
     "updated": int,
-    "total": int,
     "execution_time": float,
-    "inserted_ids": List[str],
-    "updated_ids": List[str],
     "error": str  # if success=False
 }
 ```
@@ -455,26 +449,27 @@ Manages user agent rotation for anti-detection.
 
 #### Methods
 
-##### `get_random_user_agent()`
+##### `get_random_agent()`
 
 ```python
-def get_random_user_agent(self) -> Tuple[str, Dict[str, int]]
+def get_random_agent(self, device_type: Optional[str] = None) -> str
 ```
 
-**Description:** Get random user agent with matching viewport.
+**Description:** Get random user agent string. Default distribution is ~80% desktop, ~20% mobile.
 
-**Returns:**
+##### `get_viewport()`
+
 ```python
-(
-    user_agent: str,
-    viewport: {"width": int, "height": int}
-)
+def get_viewport(self, user_agent: str) -> Dict[str, int]
 ```
+
+**Description:** Get a randomized viewport that matches the provided user agent.
 
 **Example:**
 ```python
 ua_manager = UserAgentManager.from_config()
-user_agent, viewport = ua_manager.get_random_user_agent()
+user_agent = ua_manager.get_random_agent()
+viewport = ua_manager.get_viewport(user_agent)
 ```
 
 ### 2. Configuration Classes
@@ -487,7 +482,7 @@ user_agent, viewport = ua_manager.get_random_user_agent()
 
 ## Error Handling
 
-**Common exceptions:** `CrawlerError`, `CaptchaDetectedError`, `ParseError`, `DatabaseError`
+**Common exceptions:** Generic `Exception` types are raised in current implementation; custom exception classes are not defined.
 
 ```python
 try:

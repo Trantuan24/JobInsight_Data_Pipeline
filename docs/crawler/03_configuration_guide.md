@@ -37,7 +37,7 @@ export CRAWLER_ENABLE_CDC=true
 |-----------|---------------------|---------|-------------|---------------------------|
 | `min_delay` | `CRAWLER_MIN_DELAY` | 4.0 | Minimum delay between requests (seconds) | **Optimize to 3.0** for better performance |
 | `max_delay` | `CRAWLER_MAX_DELAY` | 8.0 | Maximum delay between requests (seconds) | **Optimize to 6.0** for better performance |
-| `concurrent_backups` | N/A | min(5, max(3, cpu_count)) | Number of concurrent page backups | **Dynamic based on CPU cores** |
+| `concurrent_backups` | N/A | min(5, max(3, cpu_count)) | Number of concurrent page backups | Calculated dynamically in code; can override via runtime config dict |
 | `max_retry` | `CRAWLER_MAX_RETRY` | 3 | Maximum retry attempts per page | Increase to 4 for better reliability |
 
 **⚠️ Note**: Some modules have fallback configurations that may differ from main config.
@@ -93,14 +93,19 @@ export CRAWLER_MAX_RETRY=4         # Increased from 3
 | Parameter | Environment Variable | Default | Description |
 |-----------|---------------------|---------|-------------|
 | `cdc_days_to_keep` | `CDC_DAYS_TO_KEEP` | 15 | Days to keep CDC files |
-| `cdc_file_lock_timeout` | `CDC_LOCK_TIMEOUT` | 10 | File lock timeout (seconds) |
+| `cdc_file_lock_timeout` | `CDC_LOCK_TIMEOUT` | 10 | File lock timeout (seconds) – currently hardcoded in ingestion/cdc.py |
+
+
+**CDC File Paths:**
+- Current implementation writes JSONL to `data/cdc/YYYYMM/YYYYMMDD/cdc_YYYYMMDD.jsonl` with a `.lock` file for synchronization.
+- Path is constructed internally in `src/ingestion/cdc.py` and not yet sourced from `Config.Dirs.CDC_DIR`.
 
 ## User Agent Configuration
 
 ### User Agent Pool Management
 
 ```python
-# User agent distribution (based on crawler_config.py)
+# User agent distribution (actual runtime via UserAgentManager: ~80% desktop, ~20% mobile)
 USER_AGENTS = [
     # Desktop Chrome (70% of pool)
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36...",
@@ -129,7 +134,7 @@ CUSTOM_USER_AGENTS = [
 # Configuration
 config = {
     'user_agents': CUSTOM_USER_AGENTS,
-    'desktop_ratio': 0.7,  # 70% desktop, 30% mobile
+    'desktop_ratio': 0.8,  # ~80% desktop, 20% mobile (effective distribution)
 }
 ```
 
@@ -151,7 +156,8 @@ export CRAWLER_MIN_DELAY=3.0
 export CRAWLER_MAX_DELAY=6.0
 
 # Increase concurrency (test carefully)
-export CRAWLER_CONCURRENT_BACKUPS=4
+# concurrent_backups is not read from env; override via runtime config dict
+# e.g. in code: TopCVCrawler(config={'concurrent_backups': 4})
 ```
 
 #### 2. Improve Parse Success Rate
@@ -181,7 +187,7 @@ circuit_breaker_config = {
 export CRAWLER_NUM_PAGES=2
 export CRAWLER_MIN_DELAY=1.0
 export CRAWLER_MAX_DELAY=3.0
-export CRAWLER_CONCURRENT_BACKUPS=2
+# override via runtime config dict: {'concurrent_backups': 2}
 export CRAWLER_ENABLE_CDC=false
 ```
 
@@ -206,7 +212,7 @@ export CRAWLER_MAX_WORKERS=16
 export CRAWLER_NUM_PAGES=1
 export CRAWLER_MIN_DELAY=5.0
 export CRAWLER_MAX_DELAY=10.0
-export CRAWLER_CONCURRENT_BACKUPS=1
+# override via runtime config dict: {'concurrent_backups': 1}
 export CRAWLER_USE_PARALLEL=false
 ```
 
@@ -281,22 +287,22 @@ export CRAWLER_METRICS_OUTPUT=/opt/airflow/logs/crawler_metrics.log
 def validate_crawler_config(config):
     """Validate crawler configuration parameters"""
     errors = []
-    
+
     # Validate num_pages
     if not 1 <= config.get('num_pages', 5) <= 50:
         errors.append("num_pages must be between 1 and 50")
-    
+
     # Validate delays
     min_delay = config.get('min_delay', 4.0)
     max_delay = config.get('max_delay', 8.0)
     if min_delay >= max_delay:
         errors.append("min_delay must be less than max_delay")
-    
+
     # Validate concurrency
     concurrent_backups = config.get('concurrent_backups', 3)
     if not 1 <= concurrent_backups <= 10:
         errors.append("concurrent_backups must be between 1 and 10")
-    
+
     return errors
 ```
 
@@ -331,7 +337,7 @@ def validate_crawler_config(config):
    # Increase timeouts
    export CRAWLER_PAGE_LOAD_TIMEOUT=90000
    export CRAWLER_SELECTOR_TIMEOUT=30000
-   
+
    # Increase retries
    export CRAWLER_MAX_RETRY=5
    ```

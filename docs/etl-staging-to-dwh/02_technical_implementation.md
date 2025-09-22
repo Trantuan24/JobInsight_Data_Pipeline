@@ -60,40 +60,32 @@ else:
 
 #### Data Loading from Staging
 ```python
-def get_staging_batch(last_etl_date=None):
-    """Load staging data from PostgreSQL"""
+def get_staging_batch(last_etl_date: datetime):
+    """Load staging data từ PostgreSQL theo crawled_at"""
 
-    # Default to 7 days ago if no date specified
     if last_etl_date is None:
         last_etl_date = datetime.now() - timedelta(days=7)
 
-    query = """
-        SELECT * FROM jobinsight_staging.staging_jobs
-        WHERE (processed_to_dwh IS NULL OR processed_to_dwh = FALSE)
-        AND (created_at >= %s OR updated_at >= %s)
+    query = f"""
+        SELECT *
+        FROM {STAGING_JOBS_TABLE}
+        WHERE crawled_at >= %s
+        OR (crawled_at IS NOT NULL AND %s IS NULL)
     """
 
-    # Load into pandas DataFrame
     df = get_dataframe(query, params=(last_etl_date, last_etl_date))
-
     logger.info(f"📊 Loaded {len(df)} staging records from {last_etl_date}")
     return df
 ```
 
 #### DuckDB Connection Management
 ```python
-def get_duckdb_connection(db_path: str):
-    """Create optimized DuckDB connection"""
-
-    # Create connection với performance optimizations
-    conn = duckdb.connect(db_path)
-
-    # Optimize for ETL workload
-    conn.execute("SET memory_limit='1GB'")
-    conn.execute("SET threads=4")
-    conn.execute("SET enable_progress_bar=false")
-
-    return conn
+def get_duckdb_connection(duckdb_path: str = DUCKDB_PATH):
+    """Kết nối đến DuckDB (không set PRAGMA trong code hiện tại)"""
+    if not os.path.isabs(duckdb_path):
+        duckdb_path = os.path.join(PROJECT_ROOT, duckdb_path)
+    os.makedirs(os.path.dirname(duckdb_path), exist_ok=True)
+    return duckdb.connect(duckdb_path)
 ```
 
 ## 3. Dimensional Processing Implementation
@@ -209,7 +201,7 @@ def insert_dimension_records(conn, table_name, records):
 
 #### FactJobPostingDaily Processing
 ```python
-def process_fact_job_posting_daily(staging_df, duckdb_conn):
+def process_fact_job_posting_daily(staging_df, duckdb_conn):  # Deprecated in favor of FactHandler.generate_fact_records
     """Generate daily grain facts cho job postings"""
     
     fact_records = []
@@ -251,7 +243,7 @@ def process_fact_job_posting_daily(staging_df, duckdb_conn):
 
 #### Optimized Bulk Fact Insert
 ```python
-def bulk_insert_facts(conn, table_name, fact_records):
+def bulk_insert_facts(conn, table_name, fact_records):  # Deprecated - current path uses UPSERT per-date with RETURNING fact_id
     """Optimized bulk insert cho fact tables"""
     
     if not fact_records:

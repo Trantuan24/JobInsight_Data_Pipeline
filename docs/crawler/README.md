@@ -63,12 +63,12 @@ This directory contains comprehensive documentation for **Phase 1 - DAG Crawler 
 
 ## Quick Start
 
-### For New Developers
+### For New Team Members
 1. Start with [System Architecture](01_system_architecture.md) for overview
 2. Read [Technical Implementation](02_technical_implementation.md) for code understanding
 3. Review [Configuration Guide](03_configuration_guide.md) for setup
 
-### For Operations
+### For Operations Team
 1. Focus on [Troubleshooting Guide](05_troubleshooting_guide.md) for issue resolution
 2. Reference [Performance Analysis](04_performance_analysis.md) for optimization
 3. Use [Configuration Guide](03_configuration_guide.md) for tuning

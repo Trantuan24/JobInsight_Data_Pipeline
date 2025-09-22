@@ -24,6 +24,9 @@ async def main():
     crawler = TopCVCrawler(config=config)
     result = await crawler.crawl()
 
+    # Result keys: success, execution_time, backup{total,successful,failed},
+    # parse{total_jobs,company_count,location_count}, database{inserted,updated,execution_time}
+
     # Check results
     if result["success"]:
         print(f"Crawled {result['parse']['total_jobs']} jobs successfully")
@@ -46,7 +49,7 @@ The crawler executes in four sequential phases:
 1. **HTML Backup**: Concurrent download of web pages with anti-detection measures
 2. **HTML Parsing**: Extract structured data from downloaded HTML files
 3. **Database Operations**: Bulk insert/update operations with conflict resolution
-4. **CDC Logging**: Track changes for downstream ETL pipeline consumption
+4. **CDC Logging**: Track changes for downstream ETL pipeline consumption (Note: current implementation does not return inserted_ids; CDC action may default to 'update' unless DB layer is extended to return IDs)
 
 Each phase includes comprehensive error handling and can recover from partial failures.
 
@@ -75,7 +78,7 @@ class HTMLBackupManager:
         # Anti-detection configuration
         self.min_delay = self.config.get('min_delay', 4.0)  # seconds
         self.max_delay = self.config.get('max_delay', 8.0)  # seconds
-        self.max_retry = self.config.get('max_retry', 3)
+        self.max_retry = self.config.get('max_retry', 3)  # CaptchaHandler uses max_retries=4 internally
 
         # Note: Fallback values in backup_manager.py may differ:
         # MIN_DELAY = 3, MAX_DELAY = 6 (lines 41-42)
@@ -158,8 +161,8 @@ def detect_captcha(self, html_content: str) -> bool:
         return True
     
     # 3. Expected element validation
-    if "<div class='job-item-2'" not in html_content:
-        logger.warning("Expected job elements not found")
+    if "<div class='job-item-2'" not in html_content and "job-item-2" in html_content:
+        logger.warning("Expected job elements not found (possible block)")
         return True
     
     return False
@@ -220,7 +223,7 @@ async def apply_anti_detection(self, page):
 
 ```python
 class TopCVParser:
-    def __init__(self, max_workers=None):
+    def __init__(self, backup_dir=None, max_workers=None):
         self.max_workers = max_workers or min(32, (os.cpu_count() or 1) * 5)
         self._job_id_processed: Set[str] = set()
         self._job_data_lock = threading.Lock()
@@ -293,7 +296,7 @@ def bulk_insert_with_copy(self, df: pd.DataFrame, table_name: str) -> Dict[str, 
         
         # Execute COPY operation
         columns = ", ".join([f'"{col}"' for col in df.columns])
-        copy_query = f"COPY {table_name} ({columns}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t')"
+        copy_query = f"COPY {table_name} ({columns}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE E'\"')"
         cur.copy_expert(copy_query, output)
 ```
 

@@ -9,7 +9,7 @@
 - **Memory Usage**: Monitored nếu psutil available (typical usage varies)
 - **Success Rate**: Calculated based on processed vs total records
 - **Batch Processing**: Default batch_size=None (process all), configurable
-- **Schedule**: Daily at 11:02 AM Vietnam time after crawler completion
+- **Schedule**: Managed by Airflow DAG (see dags/etl_pipeline.py). Default cron: '40 17 * * *' (UTC), with dependency on crawler DAG completion.
 
 ## 5-Phase Processing Pipeline
 
@@ -64,10 +64,10 @@ graph LR
 
 ## 🎯 **Potential Optimization Opportunities**
 
-### **1. Batch Database Operations** (Theoretical)
-- **Current**: Individual operations trong save_back_to_staging()
-- **Opportunity**: Implement batch upserts
-- **Status**: Not yet implemented
+### **1. Batch Database Operations** (Implemented)
+- **Current**: Optimized via temp table + pandas.to_sql bulk insert + single upsert query in save_back_to_staging()
+- **Opportunity**: Further tuning (e.g., COPY + upsert) if needed
+- **Status**: Implemented
 
 ### **2. Schema Validation Caching** (Theoretical)
 - **Current**: Schema checks mỗi lần run

@@ -11,7 +11,11 @@ ETL system sử dụng environment variables và configuration dictionaries vớ
 2. **Configuration Dictionaries** (code-based)
 3. **Default Values** (system defaults)
 
-Configuration được organize thành logical groups: database connections, ETL execution parameters, performance tuning, và monitoring settings.
+Configuration được organize thành logical groups: database connections, ETL execution parameters, và monitoring settings.
+
+Notes:
+- Phase 2 hiện không dùng max_workers/raw_batch_size trong code đường dẫn chính.
+- Chức năng only_unprocessed phụ thuộc vào cột processed trong staging_jobs (chưa có mặc định).
 
 ## Core Configuration Parameters
 
@@ -42,10 +46,10 @@ export POSTGRES_SCHEMA="public"
 | Parameter | Environment Variable | Default | Description | Tuning Notes |
 |-----------|---------------------|---------|-------------|--------------|
 | `batch_size` | `ETL_BATCH_SIZE` | 500 | Records per batch | Configurable via run_etl() parameter |
-| `max_workers` | `ETL_MAX_WORKERS` | 4 | Thread pool size | For parallel processing |
+| `max_workers` | `ETL_MAX_WORKERS` | 4 | Thread pool size | Not used in current Phase 2 flow |
 | `timeout_seconds` | `ETL_TIMEOUT` | 600 | Operation timeout | Database operation timeout |
-| `raw_batch_size` | `RAW_BATCH_SIZE` | 20 | Raw data batch size | Used in bulk operations |
-| `only_unprocessed` | N/A | False | Process only new records | Function parameter only |
+| `raw_batch_size` | `RAW_BATCH_SIZE` | 20 | Raw data batch size | Not used in current Phase 2 flow |
+| `only_unprocessed` | N/A | False | Intended: process only new records | Requires 'processed' column in staging_jobs |
 | `verbose` | N/A | False | Enable detailed logging | Function parameter only |
 
 **ETL Configuration Example:**

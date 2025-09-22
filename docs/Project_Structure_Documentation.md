@@ -35,22 +35,22 @@ src/
 │
 ├── 📁 crawler/                      # Phase 1: Web Crawling
 │   ├── 📄 __init__.py
-│   ├── 📄 crawler.py                # Main crawler implementation
-│   ├── 📄 backup_manager.py         # HTML backup management
-│   ├── 📄 captcha_handler.py        # Anti-detection logic
-│   ├── 📄 parser.py                 # HTML parsing & extraction
+│   ├── 📄 crawler.py                # Main crawler orchestrator
+│   ├── 📄 backup_manager.py         # HTML backup (Playwright) + concurrency
+│   ├── 📄 captcha_handler.py        # Anti-detection helper
+│   ├── 📄 parser.py                 # HTML parsing (BeautifulSoup)
 │   ├── 📄 crawler_config.py         # Crawler configuration
-│   └── 📄 crawler_utils.py          # Crawler utilities
+│   └── 📄 crawler_utils.py          # Utilities (parse_last_update, etc.)
 │
 ├── 📁 etl/                          # Phase 2 & 3: ETL Processing
 │   ├── 📄 __init__.py
-│   ├── 📄 etl_main.py               # Main ETL orchestrator
+│   ├── 📄 etl_main.py               # Staging→DWH ETL helpers (backup, staging batch, integrity)
 │   ├── 📄 raw_to_staging.py         # Phase 2: Raw to staging ETL
-│   ├── 📄 staging_to_dwh.py         # Phase 3: Staging to DWH ETL
+│   ├── 📄 staging_to_dwh.py         # Phase 3: Staging to DWH ETL (main entry)
 │   ├── 📄 dimension_handler.py      # SCD Type 2 processing
 │   ├── 📄 fact_handler.py           # Fact table processing
-│   ├── 📄 etl_utils.py              # ETL utilities
-│   └── 📄 partitioning.py           # Data partitioning logic
+│   ├── 📄 etl_utils.py              # DuckDB setup, batch utilities
+│   └── 📄 partitioning.py           # Parquet partition mgmt
 │
 ├── 📁 db/                           # Database operations
 │   ├── 📄 __init__.py
@@ -131,7 +131,7 @@ Configuration is managed through environment variables và configuration files e
 
 | Category | Variables | Purpose | Location |
 |----------|-----------|---------|----------|
-| **Database** | `POSTGRES_URI`, `DUCKDB_PATH` | Database connections | `env.example` template |
+| **Database** | `DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME`, `DUCKDB_PATH` | Database connections | `env.example`, src/utils/config.py |
 | **Crawler** | `CRAWLER_DELAY_MIN`, `CRAWLER_MAX_PAGES` | Crawling behavior | `src/crawler/crawler_config.py` |
 | **ETL** | `ETL_BATCH_SIZE`, `ETL_LAST_DATE` | Processing control | `src/utils/config.py` |
 | **Monitoring** | `LOG_LEVEL`, `ALERT_THRESHOLDS` | Observability | `src/utils/logger.py` |
@@ -142,11 +142,11 @@ Configuration is managed through environment variables và configuration files e
 
 | Component | File | Purpose | Dependencies |
 |-----------|------|---------|--------------|
-| **Crawler** | `crawler.py` | Main crawler implementation | Playwright, BeautifulSoup |
+| **Crawler** | `crawler.py` | Main crawler implementation | Selenium, BeautifulSoup |
 | **BackupManager** | `backup_manager.py` | HTML backup management | File I/O, threading |
 | **CaptchaHandler** | `captcha_handler.py` | Anti-detection logic | Custom algorithms |
 | **Parser** | `parser.py` | HTML parsing & extraction | Pandas, RegEx |
-| **BulkOperations** | `../db/bulk_operations.py` | High-performance DB ops | Database drivers |
+| **BulkOperations** | `../db/bulk_operations.py` | High-performance DB ops (bulk upsert to PostgreSQL) | psycopg2, SQLAlchemy |
 
 ### **Phase 2: ETL Components**
 
@@ -155,7 +155,7 @@ Configuration is managed through environment variables và configuration files e
 | **RawToStaging** | `raw_to_staging.py` | Raw to staging ETL | PostgreSQL, Pandas, SQLAlchemy |
 | **DataPrepare** | `../processing/data_prepare.py` | Data preparation functions | Pandas, text processing |
 | **CDC** | `../ingestion/cdc.py` | Change Data Capture | Database triggers |
-| **ETLUtils** | `etl_utils.py` | ETL utility functions | Various database drivers |
+| **ETLUtils** | `etl_utils.py` | DuckDB connection/setup + batch insert | duckdb, pandas |
 
 ### **Phase 3: DWH Components**
 
@@ -181,12 +181,14 @@ dags/
 ```yaml
 # docker-compose.yml structure
 services:
-  crawler:          # Phase 1 container
-  etl-processor:    # Phase 2 & 3 container
-  postgresql-raw:   # Raw data storage
-  postgresql:       # Staging database
-  airflow:          # Workflow orchestration
-  monitoring:       # Observability stack
+  postgres:         # PostgreSQL (Airflow + JobInsight schemas)
+  airflow-webserver:
+  airflow-scheduler:
+  airflow-init:
+  grafana:
+volumes:
+  postgres-db-volume:
+  grafana_data:
 ```
 
 ### **Testing Structure (`tests/`)**
@@ -206,7 +208,7 @@ tests/
 ```mermaid
 graph TD
     subgraph "External Dependencies"
-        A[Playwright] --> B[Crawler]
+        A[Selenium] --> B[Crawler]
         C[Pandas] --> D[ETL Processing]
         E[DuckDB] --> F[Data Warehouse]
     end
@@ -277,7 +279,7 @@ graph TD
    # Or run individual phases:
    python -m src.crawler.crawler
    python -m src.etl.raw_to_staging
-   python -m src.etl.etl_main
+   python -m src.etl.staging_to_dwh
    ```
 
 ### **Development Guidelines**

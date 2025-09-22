@@ -27,11 +27,15 @@ else:
 ```python
 {
     "success": bool,
+    "message": str,
     "stats": {
         "total_records": int,
         "processed_records": int,
+        "success_count": int,
+        "failure_count": int,
         "success_rate": float,      # 0-100%
-        "duration_seconds": float
+        "duration_seconds": float,
+        "batch_count": int
     },
     "error": str  # if success=False
 }
@@ -77,33 +81,21 @@ CREATE TABLE staging_jobs (
 
 | Phase | Purpose | Monitoring | Status |
 |-------|---------|------------|--------|
-| **Schema Setup** | Create schema/tables | ✅ Performance tracked | Implemented |
-| **SQL Procedures** | Salary/deadline parsing | ✅ Performance tracked | Implemented |
-| **Data Loading** | Load to pandas | ✅ Performance tracked | Implemented |
-| **Python Processing** | Location/title cleaning | ✅ Performance tracked | Implemented |
-| **Data Saving** | Upsert to database | ✅ Performance tracked | Implemented |
+| **Schema Setup** | Create schema/tables and initial copy raw→staging | ✅ Performance tracked | Implemented |
+| **SQL Procedures** | Salary/deadline parsing (normalize_salary, update time_remaining) | ✅ Performance tracked | Implemented |
+| **Data Loading** | Load to pandas via get_dataframe | ✅ Performance tracked | Implemented |
+| **Python Processing** | Extract location_pairs, clean title/company | ✅ Performance tracked | Implemented |
+| **Data Saving** | Temp table + bulk insert + single upsert | ✅ Performance tracked | Implemented |
 
 ### Optimization Solutions
 
-#### 1. Batch Upserts (52% bottleneck)
+#### 1. Batch Upserts (Implemented)
 ```python
-# Current: Individual upserts (slow)
-for record in records:
-    cursor.execute("UPDATE staging_jobs SET ... WHERE job_id = %s", record)
-
-# Optimized: Batch operations (fast)
-def batch_upsert(records, batch_size=500):
-    values = [(r['job_id'], r['location_detail'], r['title']) for r in records]
-    
-    cursor.executemany("""
-        INSERT INTO staging_jobs (job_id, location_detail, title)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (job_id) DO UPDATE SET
-            location_detail = EXCLUDED.location_detail,
-            title = EXCLUDED.title
-    """, values)
-
-# Expected improvement: 30-50% reduction in Data Saving time
+# Current implementation (src/etl/raw_to_staging.py -> save_back_to_staging)
+# - Create TEMP TABLE LIKE staging_jobs
+# - pandas.to_sql bulk insert into temp table (method='multi', chunksize=1000)
+# - Single upsert: INSERT FROM temp_table ON CONFLICT (job_id) DO UPDATE SET ...
+# Expected improvement: significantly faster than per-row updates
 ```
 
 #### 2. Schema Caching (29% overhead)
@@ -165,46 +157,81 @@ For detailed configuration options, environment variables, và deployment settin
 ### Location Processing
 ```python
 def extract_location_info(html_content):
-    """Extract location details from HTML"""
-    if not html_content:
-        return None
-    
+    """Extract location details from HTML into list[str]"""
+    if pd.isna(html_content):
+        return []
+
     soup = BeautifulSoup(html_content, 'html.parser')
-    locations = []
-    
-    for element in soup.find_all(['div', 'span']):
-        text = element.get_text().strip()
-        if text and ':' in text:
-            locations.append(text)
-    
-    return locations if locations else None
+    text = soup.get_text(separator='\n')
+    results = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        if ':' in line:
+            key, value = line.split(':', 1)
+            key = key.strip(); value = value.strip()
+            if key and value:
+                results.append(f"{key}: {value}")
+        else:
+            results.append(line)
+    return results
 
 def refine_location(row):
-    """Handle multiple locations separated by &"""
+    """Refine location using location_pairs (unique cities; handle '&')"""
     location = row['location']
-    if '&' in str(location):
-        # Take first location
-        return location.split('&')[0].strip()
+    pairs = row['location_pairs']
+    if '&' in str(location) and isinstance(pairs, list) and pairs:
+        refined = []
+        seen = set()
+        for item in pairs:
+            city = item.split(':', 1)[0].strip() if ':' in item else item.strip()
+            if city and city not in seen:
+                refined.append(city); seen.add(city)
+        return ', '.join(refined)
     return location
 ```
 
 ### Data Cleaning
 ```python
 def clean_title(title):
-    """Clean job title"""
-    if not title:
-        return title
-    
-    # Remove extra whitespace và noise
-    cleaned = re.sub(r'\s+', ' ', title).strip()
-    return cleaned
+    """Clean job title (preserve tech terms, strip trailing noise)"""
+    if pd.isna(title):
+        return ""
+    matches = re.search(r'([\w\s./-]+(?:\s*(?:\/|-)\s*[\w\s./-]*)*)', title)
+    if matches:
+        cleaned_title = matches.group(1).strip()
+        cleaned_title = cleaned_title.split(' - ')[0].strip()
+    else:
+        cleaned_title = str(title).strip()
+    return cleaned_title
 
-def clean_company_name(company):
-    """Standardize company name"""
-    if not company:
-        return company
-    
-    return company.strip()
+def clean_company_name(title):
+    """Standardize job/company title preserving tech keywords"""
+    if pd.isna(title):
+        return ""
+    title = re.sub(r'[^\w\s\(\)\[\]\-\/\.,&+#]', ' ', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    remove_patterns = [r'tuyển\s+dụng', r'cần\s+tuyển', r'đang\s+tuyển', r'hot', r'gấp', r'\bhr\b']
+    for pattern in remove_patterns:
+        title = re.sub(pattern, '', title, flags=re.IGNORECASE)
+    parts = re.split(r'(\s*[\-\/]\s*)', title)
+    result = []
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            words = part.split()
+            tech_words = ['PHP','Java','Python','AWS','SQL','C#','C++','.NET','HTML','CSS','JS','UI','UX','AI','ML','iOS','API','React','Vue','Angular','Node','DevOps','QA','BA']
+            for j, word in enumerate(words):
+                if word.upper() in tech_words:
+                    words[j] = word.upper()
+                elif j == 0:
+                    words[j] = word.capitalize()
+            result.append(' '.join(words))
+        else:
+            result.append(part)
+    title = ''.join(result).strip()
+    title = re.sub(r'\s+', ' ', title)
+    return title.strip()
 ```
 
 ## 6. Error Handling & Validation

@@ -174,6 +174,8 @@ Job J001 có 2 locations:
 
 ## Cross-Database ETL Architecture
 
+Note: Parquet export và partitioning hiện được thực hiện bởi PartitionManager (src/etl/partitioning.py) theo cột load_month cho FactJobPostingDaily; output vào data/parquet/.
+
 ### PostgreSQL → DuckDB Pipeline
 
 ```mermaid
@@ -327,4 +329,4 @@ This architecture documentation provides the foundation for understanding the di
 - [Data Warehouse Schema Documentation](03_dwh_schema_design.md)
 - [Performance Optimization Guide](04_performance_optimization.md)
 - [Troubleshooting Guide](05_troubleshooting_guide.md)
-- [API Reference](06_api_reference.md)
+- [API Reference](07_api_reference.md)

@@ -1,7 +1,7 @@
 # JobInsight ETL Pipeline
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Trantuan24/JobInsight_Data_Pipeline)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/Trantuan24/JobInsight_Data_Pipeline/ci.yml?branch=main)](../../actions)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/your-org/jobinsight/ci.yml?branch=main)](../../actions)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Data Pipeline](https://img.shields.io/badge/pipeline-ETL-orange)](docs/System_Architecture_Overview.md)
@@ -48,43 +48,12 @@ JobInsight ETL Pipeline delivers **end-to-end job market intelligence** through 
 
 ### **3-Phase Processing Pipeline**
 
-```mermaid
-graph TD
-    subgraph "Phase 1: Data Acquisition"
-        A[TopCV Website] --> B[Web Crawler]
-        B --> C[Anti-Detection Layer]
-        C --> D[HTML Parser]
-        D --> E[PostgreSQL Raw Storage]
-    end
+![System Architecture](images/architecture.png)
 
-    subgraph "Phase 2: Data Standardization"
-        E --> F[Data Extractor]
-        F --> G[Cleaning & Validation]
-        G --> H[Deduplication]
-        H --> I[PostgreSQL Staging]
-    end
-
-    subgraph "Phase 3: Analytics Preparation"
-        I --> J[Dimensional Modeling]
-        J --> K[SCD Type 2 Processing]
-        K --> L[Star Schema Generation]
-        L --> M[DuckDB Data Warehouse]
-    end
-
-    subgraph "Analytics Layer"
-        M --> N[BI Dashboards]
-        M --> O[Data Science Models]
-        M --> P[Automated Reports]
-    end
-
-    style A fill:#e1f5fe
-    style E fill:#fff3e0
-    style I fill:#f3e5f5
-    style M fill:#e8f5e8
-```
+The diagram above reflects the current production setup: Phase 1 (Crawler) → Phase 2 (Raw → Staging ETL) → Phase 3 (Staging → DWH), orchestrated by Apache Airflow. Data lands in PostgreSQL (raw/staging) and DuckDB with Parquet partitions.
 
 ### **Technology Stack**
-- **Web Scraping**: Playwright + BeautifulSoup + Chromium (anti-detection)
+- **Web Scraping**: Playwright (Chromium) + anti-detection
 - **Processing**: Python + Pandas (data transformation)
 - **Storage**: PostgreSQL (raw/staging) + DuckDB (warehouse)
 - **Orchestration**: Apache Airflow (workflow management)
@@ -153,8 +122,8 @@ graph TD
 ### **🚀 One-Command Setup**
 ```bash
 # Clone repository
-git clone https://github.com/Trantuan24/JobInsight_Data_Pipeline.git
-cd JobInsight_Data_Pipeline
+git clone https://github.com/your-org/jobinsight-etl.git
+cd jobinsight-etl
 
 # Setup environment
 cp env.example .env
@@ -167,6 +136,7 @@ docker-compose up -d
 ### **🎯 Access Points**
 After containers start:
 - **Airflow UI**: http://localhost:8080 (admin/admin)
+- **Grafana Dashboard**: http://localhost:3001 (admin/admin)
 - **Database**: PostgreSQL on localhost:5432
 - **Data Warehouse**: DuckDB files in `data/duck_db/`
 
@@ -195,8 +165,8 @@ python -c "import duckdb; conn=duckdb.connect('data/duck_db/jobinsight_warehouse
 ### **Development Setup**
 ```bash
 # 1. Clone repository
-git clone https://github.com/Trantuan24/JobInsight_Data_Pipeline.git
-cd JobInsight_Data_Pipeline
+git clone https://github.com/your-org/jobinsight-etl.git
+cd jobinsight-etl
 
 # 2. Create virtual environment
 python -m venv venv
@@ -208,9 +178,6 @@ pip install -r requirements.txt
 # 4. Setup environment variables
 cp env.example .env
 # Edit .env with your configuration
-
-# 5. Initialize data directories (will be created automatically)
-# The pipeline will create necessary subdirectories in data/ and logs/
 ```
 
 ### **Database Setup**
@@ -220,8 +187,8 @@ psql -U $DB_USER -h $DB_HOST -d $DB_NAME -f sql/schema_raw_jobs.sql
 psql -U $DB_USER -h $DB_HOST -d $DB_NAME -f sql/schema_staging.sql
 psql -U $DB_USER -h $DB_HOST -d $DB_NAME -f sql/stored_procedures.sql
 
-# Initialize DuckDB warehouse
-python -m src.utils.setup_dwh
+# Initialize DuckDB warehouse (schema will also be created automatically by Phase 3 ETL)
+python -c "from src.etl.etl_utils import setup_duckdb_schema; print('Setup OK' if setup_duckdb_schema() else 'Setup FAILED')"
 ```
 
 ### **Docker Deployment**
@@ -238,11 +205,11 @@ docker-compose up -d
 ### **Environment Variables**
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POSTGRES_HOST` | localhost | PostgreSQL host for raw/staging data |
-| `POSTGRES_PORT` | 5432 | PostgreSQL port |
-| `POSTGRES_USER` | jobinsight | Database user |
-| `POSTGRES_PASSWORD` | jobinsight | Database password |
-| `POSTGRES_DB` | jobinsight | Database name |
+| `DB_HOST` | postgres | PostgreSQL host for raw/staging data |
+| `DB_PORT` | 5432 | PostgreSQL port |
+| `DB_USER` | jobinsight | Database user |
+| `DB_PASSWORD` | jobinsight | Database password |
+| `DB_NAME` | jobinsight | Database name |
 | `DUCKDB_PATH` | data/duck_db/jobinsight_warehouse.duckdb | DuckDB warehouse path |
 | `DISCORD_WEBHOOK_URL` | - | Discord notifications webhook |
 | `AIRFLOW_UID` | 50000 | Airflow container UID |
@@ -262,8 +229,8 @@ export ETL_BATCH_SIZE=500
 export ETL_MAX_WORKERS=4
 export ETL_TIMEOUT=600
 
-# DuckDB optimization (via connection settings)
-# Memory limit và threads configured in code
+# DuckDB notes
+# Hiện tại không cấu hình memory_limit/threads trong code; có thể thiết lập thủ công trong phiên DuckDB nếu cần
 ```
 
 ## Usage
@@ -273,7 +240,7 @@ export ETL_TIMEOUT=600
 # Run individual phases
 python -m src.crawler.crawler          # Phase 1: Web crawling
 python -m src.etl.raw_to_staging        # Phase 2: Data standardization
-python -m src.etl.etl_main              # Phase 3: Dimensional modeling
+python -m src.etl.staging_to_dwh        # Phase 3: Dimensional modeling
 
 # Or use Airflow DAGs for orchestrated execution
 ```
@@ -301,7 +268,7 @@ conn.execute("""
     SELECT
         dc.company_name_standardized,
         COUNT(*) as job_count,
-        AVG(f.salary_avg) as avg_salary
+        AVG((COALESCE(f.salary_min,0) + COALESCE(f.salary_max,0))/2.0) as avg_salary
     FROM FactJobPostingDaily f
     JOIN DimCompany dc ON f.company_sk = dc.company_sk
     WHERE dc.is_current = TRUE
@@ -339,49 +306,21 @@ pytest --cov=src tests/
 
 ### **Project Structure**
 ```
-JobInsight_Data_Pipeline/
-├── 📁 dags/                    # Airflow DAG definitions
-│   ├── crawl_jobs.py          # Job crawling DAG
-│   └── etl_pipeline.py        # ETL processing DAG
-├── 📁 docs/                    # Comprehensive documentation
-│   ├── README.md              # Documentation overview
-│   ├── System_Architecture_Overview.md
-│   ├── Project_Structure_Documentation.md
-│   ├── crawler/               # Phase 1 documentation
-│   ├── etl-raw-to-staging/    # Phase 2 documentation
-│   └── etl-staging-to-dwh/    # Phase 3 documentation
-├── 📁 data/                    # Data storage (excluded from Git)
-│   ├── cdc/                   # Change Data Capture files
-│   ├── duck_db/               # DuckDB warehouse files
-│   ├── parquet/               # Parquet data files
-│   └── raw_backup/            # HTML backup files from crawling
-├── 📁 sql/                     # Database schemas & procedures
-│   ├── schema_raw_jobs.sql    # Raw data schema
-│   ├── schema_staging.sql     # Staging schema
-│   ├── schema_dwh.sql         # Data warehouse schema
-│   ├── stored_procedures.sql  # ETL stored procedures
-│   └── views.sql              # Analytics views
-├── 📁 src/                     # Source code
-│   ├── crawler/               # Phase 1: Web crawling
-│   ├── etl/                   # Phase 2 & 3: ETL processing
-│   ├── db/                    # Database operations
-│   ├── processing/            # Data processing utilities
-│   ├── ingestion/             # Data ingestion modules
-│   ├── utils/                 # Shared utilities
-│   └── common/                # Common decorators & helpers
-├── 📁 tests/                   # Unit & integration tests
-│   ├── test_crawler.py        # Crawler tests
-│   ├── test_ingest.py         # Ingestion tests
-│   ├── test_raw_staging.py    # Raw to staging tests
-│   └── test_staging_to_dwh.py # Staging to DWH tests
-├── 📁 logs/                    # Application logs (excluded from Git)
-├── 🐳 docker-compose.yml       # Docker orchestration
-├── 🐳 Dockerfile              # Container definition
-├── ⚙️ airflow.cfg             # Airflow configuration
-├── 📋 requirements.txt        # Python dependencies
-├── 📄 env.example             # Environment variables template
-├── 📄 LICENSE                 # MIT License
-└── 📖 README.md               # This file
+jobinsight-etl/
+├── dags/                 # Airflow DAG definitions
+├── docs/                 # Comprehensive documentation
+├── data/                 # Data storage (raw, staging, warehouse)
+├── sql/                  # Database schemas & procedures
+├── src/
+│   ├── crawler/          # Phase 1: Web crawling
+│   ├── etl/              # Phase 2 & 3: ETL processing
+│   ├── db/               # Database operations
+│   ├── processing/       # Data processing utilities
+│   ├── utils/            # Shared utilities
+│   └── common/           # Common decorators & helpers
+├── tests/                # Unit & integration tests
+├── logs/                 # Application logs
+└── requirements.txt      # Python dependencies
 ```
 
 ## Documentation
@@ -403,7 +342,7 @@ JobInsight_Data_Pipeline/
 
 ## Contributing
 
-Contributions are welcome! Please follow these steps:
+We welcome contributions! Please follow these steps:
 
 1. **Fork** the repository
 2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
@@ -420,8 +359,8 @@ Contributions are welcome! Please follow these steps:
 
 ## License
 
-MIT © 2025
+MIT © 2025 JobInsight Team
 
 ---
 
-**Built with ❤️ for Vietnamese job market intelligence**
+**Built with ❤️ for the Vietnamese job market intelligence community**

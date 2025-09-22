@@ -19,18 +19,16 @@ Configuration được organize thành logical groups: DuckDB settings, ETL exec
 
 | Parameter | Environment Variable | Default | Description | Production Recommendations |
 |-----------|---------------------|---------|-------------|---------------------------|
-| `duckdb_path` | `DUCKDB_PATH` | `data/jobinsight_dwh.duckdb` | DuckDB database file path | Use absolute path trong production |
-| `memory_limit` | `DUCKDB_MEMORY_LIMIT` | `2GB` | DuckDB memory limit | **Optimize to 4GB** cho better performance |
-| `threads` | `DUCKDB_THREADS` | 4 | Number of processing threads | **Auto-detect CPU cores** |
-| `checkpoint_threshold` | `DUCKDB_CHECKPOINT_THRESHOLD` | `1GB` | Checkpoint trigger threshold | Increase to 2GB cho large datasets |
+| `duckdb_path` | `DUCKDB_PATH` | `data/duck_db/jobinsight_warehouse.duckdb` | DuckDB database file path | Use absolute path trong production |
+| `memory_limit` | `DUCKDB_MEMORY_LIMIT` | N/A | Not used in current code | Not supported via config.py |
+| `threads` | `DUCKDB_THREADS` | N/A | Not used in current code | Not supported via config.py |
+| `checkpoint_threshold` | `DUCKDB_CHECKPOINT_THRESHOLD` | N/A | Not used in current code | Not supported via config.py |
 
-**Optimized Configuration (Based on Analysis):**
+**Notes:**
+- Hiện tại, code không set PRAGMA memory_limit/threads/checkpoint_threshold từ config. Nếu cần, hãy cấu hình trực tiếp trong DuckDB session ngoài phạm vi ETL, hoặc bổ sung tính năng trong tương lai.
 ```bash
-# Recommended DuckDB optimizations
-export DUCKDB_PATH="/data/warehouse/jobinsight_dwh.duckdb"
-export DUCKDB_MEMORY_LIMIT="4GB"        # Increased from 2GB
-export DUCKDB_THREADS="8"               # Auto-detect or set based on CPU
-export DUCKDB_CHECKPOINT_THRESHOLD="2GB" # Increased from 1GB
+# Example: chỉ đặt DUCKDB_PATH
+export DUCKDB_PATH="/data/duck_db/jobinsight_warehouse.duckdb"
 ```
 
 ### 2. ETL Execution Settings
@@ -38,9 +36,9 @@ export DUCKDB_CHECKPOINT_THRESHOLD="2GB" # Increased from 1GB
 | Parameter | Environment Variable | Default | Description | Tuning Notes |
 |-----------|---------------------|---------|-------------|--------------|
 | `last_etl_date` | `ETL_LAST_DATE` | 7 days ago | Starting date cho incremental processing | Set based on business requirements |
-| `batch_size` | `ETL_BATCH_SIZE` | None (all) | Number of staging records per batch | **Use 1000** cho memory efficiency |
-| `verbose` | `ETL_VERBOSE` | false | Enable detailed logging | Enable trong development |
-| `dry_run` | `ETL_DRY_RUN` | false | Validate without making changes | Use cho testing |
+| `batch_size` | `ETL_BATCH_SIZE` | 1000 | Batch size cho run_incremental_etl | Dùng trong etl_main.run_incremental_etl |
+| `verbose` | `ETL_VERBOSE` | false | Enable detailed logging | N/A trong code hiện tại |
+| `dry_run` | `ETL_DRY_RUN` | false | Validate without making changes | N/A trong code hiện tại |
 
 **Example Configuration:**
 ```bash
@@ -55,18 +53,17 @@ export ETL_DRY_RUN=false
 
 | Parameter | Environment Variable | Default | Description | Production Recommendations |
 |-----------|---------------------|---------|-------------|---------------------------|
-| `bulk_fact_generation` | `ETL_BULK_FACTS` | false | Enable bulk fact operations | **Enable for 70% improvement** |
-| `parallel_dimensions` | `ETL_PARALLEL_DIMS` | false | Enable parallel dimension processing | **Enable for 30% improvement** |
-| `schema_caching` | `ETL_SCHEMA_CACHE` | false | Cache schema validation | **Enable for faster startup** |
-| `memory_monitoring` | `ETL_MEMORY_MONITOR` | false | Enable memory usage monitoring | Enable trong production |
+| `bulk_fact_generation` | `ETL_BULK_FACTS` | N/A | Not used | Ý tưởng tối ưu hóa trong docs, chưa implement |
+| `parallel_dimensions` | `ETL_PARALLEL_DIMS` | N/A | Not used | Ý tưởng tối ưu hóa trong docs, chưa implement |
+| `schema_caching` | `ETL_SCHEMA_CACHE` | N/A | Not used | Ý tưởng tối ưu hóa, chưa implement |
+| `memory_monitoring` | `ETL_MEMORY_MONITOR` | N/A | Not used | Chưa implement |
 
-**Performance-Optimized Configuration:**
+Loạt ENV dưới đây chưa được code sử dụng. Chỉ nên coi là định hướng:
 ```bash
-# Performance optimizations (based on bottleneck analysis)
-export ETL_BULK_FACTS=true           # 70% improvement trong fact processing
-export ETL_PARALLEL_DIMS=true       # 30% improvement trong dimensions
-export ETL_SCHEMA_CACHE=true         # Faster schema setup
-export ETL_MEMORY_MONITOR=true       # Production monitoring
+export ETL_BULK_FACTS=true
+export ETL_PARALLEL_DIMS=true
+export ETL_SCHEMA_CACHE=true
+export ETL_MEMORY_MONITOR=true
 ```
 
 ### 4. Database Connection Settings
@@ -202,17 +199,9 @@ POSTGRES_DB=jobinsight_dev
 
 ### config/production.env
 ```bash
-# Production environment configuration
-DUCKDB_PATH=/prod/data/jobinsight_dwh.duckdb
-DUCKDB_MEMORY_LIMIT=4GB
-DUCKDB_THREADS=8
-DUCKDB_CHECKPOINT_THRESHOLD=2GB
+# Production environment configuration (đã giản lược theo code hiện tại)
+DUCKDB_PATH=/prod/data/duck_db/jobinsight_warehouse.duckdb
 ETL_BATCH_SIZE=1000
-ETL_VERBOSE=false
-ETL_BULK_FACTS=true
-ETL_PARALLEL_DIMS=true
-ETL_SCHEMA_CACHE=true
-ETL_MEMORY_MONITOR=true
 POSTGRES_HOST=prod-db-cluster.company.com
 POSTGRES_POOL_SIZE=20
 ```

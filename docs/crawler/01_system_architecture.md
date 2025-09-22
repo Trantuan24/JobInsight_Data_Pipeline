@@ -151,7 +151,7 @@ sequenceDiagram
 ## Deployment Architecture
 
 ### Container Environment
-- **Runtime**: Docker container with Python 3.13+
+- **Runtime**: Docker container with Python 3.10 (python:3.10-slim)
 - **Dependencies**: Playwright, BeautifulSoup, psycopg2, pandas
 - **Resource Requirements**: 
   - Memory: ~1.2GB during execution
@@ -170,7 +170,7 @@ sequenceDiagram
 - **User-Agent Rotation**: 40 realistic browser signatures
 - **Fingerprint Masking**: JavaScript injection to hide automation
 - **Behavioral Simulation**: Human-like scrolling and timing
-- **IP Rotation**: Circuit breaker to prevent IP bans
+- **Circuit Breaker**: Pause after multiple failures to reduce risk of IP bans (no proxy rotation by default)
 
 ### Data Privacy
 - **No PII Collection**: Only public job posting data

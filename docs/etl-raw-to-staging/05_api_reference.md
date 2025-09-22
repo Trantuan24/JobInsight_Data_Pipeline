@@ -10,9 +10,13 @@ Essential API documentation cho Raw to Staging ETL functions và usage patterns.
 
 Main ETL orchestrator function.
 
+Notes:
+- `only_unprocessed=True` hiện chỉ set query_filter = "WHERE processed IS NULL OR processed = FALSE", nhưng schema staging_jobs mặc định chưa có cột processed.
+- Do đó, lọc theo only_unprocessed chưa có hiệu lực nếu chưa bổ sung cột.
+
 **Parameters:**
 - `batch_size` (int): Max records to process. Default: None (all)
-- `only_unprocessed` (bool): Process only unprocessed records. Default: False
+- `only_unprocessed` (bool): Intended to process only unprocessed records. Default: False
 - `verbose` (bool): Enable detailed logging. Default: False
 
 **Returns:**
@@ -57,20 +61,24 @@ except Exception as e:
 ## 2. Supporting Functions
 
 ### `setup_database_schema()`
-Ensures staging schema và tables exist.
+Ensures staging schema và tables exist, and copies raw_jobs → staging_jobs via SQL files.
+- Executes sql/schema_staging.sql and sql/insert_raw_to_staging.sql
 ```python
 from src.etl.raw_to_staging import setup_database_schema
 
 if setup_database_schema():
-    print("✅ Database schema ready")
+    print("✅ Database schema ready and initial data loaded to staging_jobs")
 ```
 
-### `load_staging_data(limit=None, query_filter=None)`
+### `load_staging_data(limit=None, offset=0, query_filter=None)`
 Loads data from staging_jobs table với optional filtering.
 
 **Parameters:**
 - `limit` (int, optional): Giới hạn số bản ghi, mặc định None (tất cả)
-- `query_filter` (str, optional): Điều kiện WHERE, ví dụ: "WHERE processed IS NULL"
+- `offset` (int, optional): Vị trí bắt đầu (phục vụ phân trang), mặc định 0
+- `query_filter` (str, optional): Điều kiện WHERE, ví dụ: "WHERE location_detail IS NOT NULL"
+
+Note: Cột processed hiện không có trong schema_staging.sql; việc lọc theo processed (only_unprocessed=True) chưa khả dụng trong phiên bản hiện tại.
 
 ```python
 from src.etl.raw_to_staging import load_staging_data
@@ -88,11 +96,11 @@ df = load_staging_data(query_filter="WHERE processed IS NULL OR processed = FALS
 ### `process_staging_data(df)`
 Applies Python transformations to DataFrame.
 
-**Processing Steps:**
-1. Extract location_info from location_detail
-2. Refine location using location_pairs
-3. Clean title với clean_title
-4. Standardize company_name
+**Processing Steps (actual):**
+1. Extract location_pairs from location_detail (list[str])
+2. Refine location using location_pairs (unique cities; handles multi-location with '&')
+3. Create title_clean via clean_title(title)
+4. Create company_name_standardized via clean_company_name(company_name)
 
 ```python
 from src.etl.raw_to_staging import process_staging_data

@@ -23,41 +23,35 @@ erDiagram
     
     DimJob {
         job_sk INTEGER PK "Surrogate key"
-        job_id VARCHAR UK "Natural key"
-        title_clean VARCHAR "Cleaned job title"
+        job_id VARCHAR(20) UK "Natural key"
+        title_clean VARCHAR(255) "Cleaned job title"
+        job_url TEXT
         skills JSON "Skills array"
+        last_update VARCHAR(100)
+        logo_url TEXT
         effective_date DATE "SCD start date"
         expiry_date DATE "SCD end date"
         is_current BOOLEAN "Current record flag"
-        created_date TIMESTAMP "Record creation"
-        updated_date TIMESTAMP "Last update"
     }
     
     DimCompany {
         company_sk INTEGER PK "Surrogate key"
-        company_name_standardized VARCHAR "Cleaned company name"
+        company_name_standardized VARCHAR(200) "Cleaned company name"
+        company_url TEXT
         verified_employer BOOLEAN "Verification status"
-        company_size VARCHAR "Size category"
-        industry VARCHAR "Industry sector"
         effective_date DATE "SCD start date"
         expiry_date DATE "SCD end date"
         is_current BOOLEAN "Current record flag"
-        created_date TIMESTAMP "Record creation"
-        updated_date TIMESTAMP "Last update"
     }
     
     DimLocation {
         location_sk INTEGER PK "Surrogate key"
-        province VARCHAR "Province/State"
-        city VARCHAR "City name"
-        district VARCHAR "District/Area"
-        region VARCHAR "Geographic region"
-        location_hierarchy VARCHAR "Full hierarchy"
+        province VARCHAR(100) "Province/State"
+        city VARCHAR(100) "City name"
+        district VARCHAR(100) "District/Area"
         effective_date DATE "SCD start date"
         expiry_date DATE "SCD end date"
         is_current BOOLEAN "Current record flag"
-        created_date TIMESTAMP "Record creation"
-        updated_date TIMESTAMP "Last update"
     }
     
     FactJobPostingDaily {
@@ -68,13 +62,12 @@ erDiagram
         salary_min NUMERIC "Minimum salary"
         salary_max NUMERIC "Maximum salary"
         salary_type VARCHAR "Currency type"
-        salary_avg NUMERIC "Calculated average"
         due_date TIMESTAMP "Application deadline"
-        days_to_deadline INTEGER "Days remaining"
-        is_active BOOLEAN "Job active flag"
-        load_month VARCHAR "Partition key"
-        created_date TIMESTAMP "Record creation"
-        etl_batch_id VARCHAR "ETL batch identifier"
+        time_remaining TEXT
+        verified_employer BOOLEAN
+        posted_time TIMESTAMP
+        crawled_at TIMESTAMP
+        load_month VARCHAR(7) "Partition key"
     }
     
     FactJobLocationBridge {
@@ -101,19 +94,26 @@ erDiagram
 CREATE TABLE DimJob (
     job_sk INTEGER PRIMARY KEY,
     job_id VARCHAR(20) UNIQUE NOT NULL,
-    title_clean VARCHAR(255),
+    title_clean VARCHAR(255) NOT NULL,
+    job_url TEXT,
     skills JSON,
+    last_update VARCHAR(100),
+    logo_url TEXT,
     effective_date DATE NOT NULL,
-    expiry_date DATE NOT NULL,
-    is_current BOOLEAN NOT NULL DEFAULT TRUE,
-    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    expiry_date DATE,
+    is_current BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 -- Indexes for performance
-CREATE INDEX idx_dimjob_job_id ON DimJob(job_id);
-CREATE INDEX idx_dimjob_current ON DimJob(is_current);
-CREATE INDEX idx_dimjob_effective ON DimJob(effective_date, expiry_date);
+CREATE INDEX IF NOT EXISTS idx_dimjob_current ON DimJob(is_current);
+CREATE INDEX IF NOT EXISTS idx_dimcompany_current ON DimCompany(is_current);
+CREATE INDEX IF NOT EXISTS idx_dimlocation_current ON DimLocation(is_current);
+CREATE INDEX IF NOT EXISTS idx_fact_date ON FactJobPostingDaily(date_id);
+CREATE INDEX IF NOT EXISTS idx_fact_load_month ON FactJobPostingDaily(load_month);
+CREATE INDEX IF NOT EXISTS idx_fact_job_date ON FactJobPostingDaily(job_sk, date_id);
+CREATE INDEX IF NOT EXISTS idx_fact_company_date ON FactJobPostingDaily(company_sk, date_id);
+CREATE INDEX IF NOT EXISTS idx_dimcompany_name ON DimCompany(company_name_standardized) WHERE is_current = TRUE;
+CREATE INDEX IF NOT EXISTS idx_dimlocation_city ON DimLocation(city) WHERE is_current = TRUE;
 ```
 
 #### SCD Type 2 Example
@@ -140,14 +140,11 @@ job_sk | job_id | title_clean | effective_date | expiry_date | is_current
 CREATE TABLE DimCompany (
     company_sk INTEGER PRIMARY KEY,
     company_name_standardized VARCHAR(200) NOT NULL,
-    verified_employer BOOLEAN DEFAULT FALSE,
-    company_size VARCHAR(50),
-    industry VARCHAR(100),
+    company_url TEXT,
+    verified_employer BOOLEAN,
     effective_date DATE NOT NULL,
-    expiry_date DATE NOT NULL,
-    is_current BOOLEAN NOT NULL DEFAULT TRUE,
-    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    expiry_date DATE,
+    is_current BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 -- Indexes
@@ -178,15 +175,11 @@ company_sk | company_name | verified_employer | effective_date | is_current
 CREATE TABLE DimLocation (
     location_sk INTEGER PRIMARY KEY,
     province VARCHAR(100),
-    city VARCHAR(100),
+    city VARCHAR(100) NOT NULL,
     district VARCHAR(100),
-    region VARCHAR(50),
-    location_hierarchy VARCHAR(300),
     effective_date DATE NOT NULL,
-    expiry_date DATE NOT NULL,
-    is_current BOOLEAN NOT NULL DEFAULT TRUE,
-    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    expiry_date DATE,
+    is_current BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 -- Indexes
@@ -249,22 +242,19 @@ CREATE TABLE FactJobPostingDaily (
     job_sk INTEGER NOT NULL,
     company_sk INTEGER NOT NULL,
     date_id DATE NOT NULL,
-    salary_min NUMERIC(12,2),
-    salary_max NUMERIC(12,2),
+    salary_min NUMERIC,
+    salary_max NUMERIC,
     salary_type VARCHAR(20),
-    salary_avg NUMERIC(12,2),
     due_date TIMESTAMP,
-    days_to_deadline INTEGER,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    time_remaining TEXT,
+    verified_employer BOOLEAN,
+    posted_time TIMESTAMP,
+    crawled_at TIMESTAMP,
     load_month VARCHAR(7) NOT NULL,
-    created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    etl_batch_id VARCHAR(50),
-    
-    -- Constraints
-    UNIQUE (job_sk, date_id),
-    FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
-    FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
-    FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
+    -- FOREIGN KEY (job_sk) REFERENCES DimJob(job_sk),
+    -- FOREIGN KEY (company_sk) REFERENCES DimCompany(company_sk),
+    -- FOREIGN KEY (date_id) REFERENCES DimDate(date_id)
+    UNIQUE (job_sk, date_id)
 );
 
 -- Partitioning by load_month

@@ -68,18 +68,18 @@ else:
 
 ### `get_staging_batch()`
 
-Load staging data from PostgreSQL với filtering logic.
+Load staging data từ PostgreSQL với điều kiện theo crawled_at.
 
 #### **Function Signature**
 ```python
-def get_staging_batch(last_etl_date: Optional[datetime] = None) -> pd.DataFrame:
+def get_staging_batch(last_etl_date: datetime) -> pd.DataFrame:
 ```
 
 #### **Parameters**
-- **`last_etl_date`** *(Optional[datetime])*: Starting date for data loading. Default: 7 days ago
+- **`last_etl_date`** *(datetime)*: Mốc thời gian bắt đầu lấy dữ liệu; truyền None sẽ load tất cả bản ghi có crawled_at NOT NULL
 
 #### **Returns**
-- **`pd.DataFrame`**: Staging data với processed_to_dwh filtering applied
+- **`pd.DataFrame`**: Dữ liệu staging được lọc theo điều kiện crawled_at >= last_etl_date OR (crawled_at IS NOT NULL AND last_etl_date IS NULL)
 
 #### **Example**
 ```python
@@ -203,24 +203,18 @@ print(f"🌉 Generated {len(bridge_records)} bridge records")
 
 ### `get_duckdb_connection()`
 
-Create optimized DuckDB connection for ETL workload.
+Tạo DuckDB connection đến file DWH.
 
 #### **Function Signature**
 ```python
-def get_duckdb_connection(
-    duckdb_path: str = DUCKDB_PATH,
-    memory_limit: str = '2GB',
-    threads: int = 4
-) -> duckdb.DuckDBPyConnection:
+def get_duckdb_connection(duckdb_path: str = DUCKDB_PATH) -> duckdb.DuckDBPyConnection:
 ```
 
 #### **Parameters**
-- **`duckdb_path`** *(str)*: Path to DuckDB database file
-- **`memory_limit`** *(str)*: Memory limit for DuckDB. Default: '2GB'
-- **`threads`** *(int)*: Number of threads. Default: 4
+- **`duckdb_path`** *(str)*: Đường dẫn tới file DuckDB. Hỗ trợ relative và absolute path
 
 #### **Returns**
-- **`duckdb.DuckDBPyConnection`**: Optimized DuckDB connection
+- **`duckdb.DuckDBPyConnection`**: DuckDB connection
 
 #### **Example**
 ```python
@@ -239,22 +233,15 @@ conn = get_duckdb_connection(
 
 ### `setup_duckdb_schema()`
 
-Setup DuckDB schema và tables for data warehouse.
+Khởi tạo schema/tables DWH trong DuckDB bằng script sql/schema_dwh.sql.
 
 #### **Function Signature**
 ```python
-def setup_duckdb_schema(
-    conn: duckdb.DuckDBPyConnection = None,
-    force_recreate: bool = False
-) -> bool:
+def setup_duckdb_schema() -> bool:
 ```
 
-#### **Parameters**
-- **`conn`** *(Optional[duckdb.DuckDBPyConnection])*: DuckDB connection. Default: create new
-- **`force_recreate`** *(bool)*: Force recreation of existing tables. Default: False
-
 #### **Returns**
-- **`bool`**: Success status
+- **`bool`**: True nếu tạo/đảm bảo bảng thành công, False nếu lỗi
 
 #### **Example**
 ```python
@@ -269,7 +256,7 @@ if success:
 
 ### `batch_insert_records()`
 
-Optimized batch insert for dimension và fact tables.
+Batch insert cho dimension/fact tables (src/etl/etl_utils.py).
 
 #### **Function Signature**
 ```python
@@ -278,19 +265,19 @@ def batch_insert_records(
     table_name: str,
     records: List[Dict],
     batch_size: int = 1000,
-    upsert_on_conflict: Optional[str] = None
+    on_conflict: str = None
 ) -> int:
 ```
 
 #### **Parameters**
 - **`duck_conn`** *(duckdb.DuckDBPyConnection)*: DuckDB connection
-- **`table_name`** *(str)*: Target table name
-- **`records`** *(List[Dict])*: Records to insert
-- **`batch_size`** *(int)*: Batch size for processing. Default: 1000
-- **`upsert_on_conflict`** *(Optional[str])*: Conflict resolution strategy
+- **`table_name`** *(str)*: Tên bảng đích
+- **`records`** *(List[Dict])*: Danh sách bản ghi
+- **`batch_size`** *(int)*: Kích thước batch. Mặc định 1000
+- **`on_conflict`** *(Optional[str])*: Cú pháp xử lý conflict, ví dụ: "ON CONFLICT (date_id) DO NOTHING" hoặc dùng INSERT OR IGNORE
 
 #### **Returns**
-- **`int`**: Number of records successfully inserted
+- **`int`**: Số bản ghi insert thành công
 
 #### **Example**
 ```python
